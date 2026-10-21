@@ -4,8 +4,9 @@
    Algorithm:
    1. Find named forms with exact boundaries
    2. Compile a dependency-minimal target ns form
-   3. Write new file with forms in topological order
-   4. Remove forms from source file
+   3. Write new file with forms in topological order; forms in a dependency
+      cycle follow in source order, declared first when used before definition
+   4. Remove forms from source file, and their names from source declares
    5. Add a source require only when remaining forms call moved Vars
    6. Report callers that may need updating
 
@@ -162,6 +163,69 @@
                  line-chunks)
          (apply str))))
 
+(defn- declare-locations
+  "Every top-level `(declare ...)` in source, with its symbol names and
+  1-based start and end rows."
+  [source]
+  (loop [zloc (z/of-string source {:track-position? true})
+         found []]
+    (if (nil? zloc)
+      found
+      (recur (z/right zloc)
+             (if (and (z/list? zloc)
+                      (= "declare" (some-> zloc z/down z/string)))
+               (let [children (->> (z/down zloc) z/right
+                                   (iterate z/right)
+                                   (take-while some?))
+                     [[start-row] [end-row]] (z/position-span zloc)]
+                 (conj found {:start-row start-row
+                              :end-row end-row
+                              :symbols (->> children
+                                            (filter #(symbol? (z/sexpr %)))
+                                            (mapv z/string))
+                              :only-symbols? (every? #(symbol? (z/sexpr %))
+                                                     children)}))
+               found)))))
+
+(defn- drop-moved-declares
+  "Remove moved names from the source's top-level `declare` forms. A declare
+  left naming nothing is removed with its line, like a moved form."
+  [source moved-names]
+  (let [moved? (set moved-names)
+        ;; First remove moved symbols from declares that keep another name.
+        partial-edited
+        (loop [zloc (z/of-string source)]
+          (let [zloc (if (and (z/list? zloc)
+                              (= "declare" (some-> zloc z/down z/string)))
+                       (loop [form zloc
+                              child (z/right (z/down zloc))]
+                         (cond
+                           (nil? child) form
+                           (and (moved? (z/string child))
+                                (some #(not (moved? %))
+                                      (->> (z/down form) z/right
+                                           (iterate z/right)
+                                           (take-while some?)
+                                           (map z/string))))
+                           (let [form' (z/up (z/remove child))]
+                             (recur form' (z/right (z/down form'))))
+                           :else (recur form (z/right child))))
+                       zloc)]
+            (if-let [next-zloc (z/right zloc)]
+              (recur next-zloc)
+              (z/root-string zloc))))
+        ;; Then remove declares whose every name moved.
+        emptied (->> (declare-locations partial-edited)
+                     (filter #(and (:only-symbols? %)
+                                   (seq (:symbols %))
+                                   (every? moved? (:symbols %))))
+                     (map (fn [{:keys [start-row end-row]}]
+                            {:comment-start (dec start-row)
+                             :end-line end-row})))]
+    (if (seq emptied)
+      (remove-form-ranges partial-edited emptied)
+      partial-edited)))
+
 (defn- validate-complete-source!
   [file source]
   (try
@@ -178,7 +242,8 @@
   "Purely compile and parse the complete source and target after extraction."
   [{:keys [source source-file target-file form-ranges target-source target-ns
            target-alias source-referred-forms]}]
-  (let [source-without-forms (remove-form-ranges source form-ranges)
+  (let [source-without-forms (-> (remove-form-ranges source form-ranges)
+                                 (drop-moved-declares (map :name form-ranges)))
         future-source (if (seq source-referred-forms)
                         (add-require-to-ns source-without-forms
                                            target-ns
@@ -315,7 +380,27 @@
                         :text (str/join "\n"
                                         (subvec lines form-start form-end))}))))
             texts-by-name (into {} (map (juxt :name identity) form-texts))
-            ordered-texts (mapv #(get texts-by-name %) topo-order)
+            ;; Forms in a dependency cycle, and forms that depend on one, never
+            ;; reach the topological order. They follow it in source order, and
+            ;; any of them used before its definition is declared first.
+            ordered-names (into (vec topo-order)
+                                (->> form-texts
+                                     (map :name)
+                                     (remove (set topo-order))))
+            ordered-texts (mapv #(get texts-by-name %) ordered-names)
+            forward-declared
+            (let [deps (into {}
+                             (map (juxt :name :depends-on))
+                             (analyze/intra-ns-deps zloc))
+                  position (zipmap ordered-names (range))]
+              (->> ordered-names
+                   (mapcat (fn [form-name]
+                             (->> (get deps form-name)
+                                  (filter #(when-let [p (position %)]
+                                             (> p (position form-name))))
+                                  (sort-by position))))
+                   distinct
+                   vec))
             header-result
             (extract-header/compile-target-header
               {:source-ns-form ns-form-text
@@ -369,6 +454,10 @@
               (str
                 (str/join "\n\n"
                           (concat [(:ns-form header-result)]
+                                  (when (seq forward-declared)
+                                    [(str "(declare "
+                                          (str/join " " forward-declared)
+                                          ")")])
                                   (map :text publicized-texts)))
                 "\n"))
             captured-sources (assoc workspace-sources (str file) source)

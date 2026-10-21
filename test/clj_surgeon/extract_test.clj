@@ -473,6 +473,90 @@
         (is (not (.exists target))))
       (finally (delete-recursive! root)))))
 
+;; Field failure (2026-10-21, found while planning moves into existing
+;; namespaces): extracting forms that call each other removed them from the
+;; source but wrote neither to the target, and reported success. The
+;; topological order omitted every form in a dependency cycle, and every form
+;; that depends on one. The same run left `(declare odd-step)` in the source.
+(def ^:private mutual-recursion-source
+  (str "(ns app.core)\n\n"
+       "(declare odd-step later)\n\n"
+       "(defn even-step [n]\n"
+       "  (if (zero? n) true (odd-step (dec n))))\n\n"
+       "(defn odd-step [n]\n"
+       "  (if (zero? n) false (even-step (dec n))))\n\n"
+       "(defn parity [n] (if (even-step n) :even :odd))\n\n"
+       "(defn main [] [(parity 4) (later)])\n\n"
+       "(defn later [] :later)\n"))
+
+(defn- mutual-recursion-plan []
+  (extract/compile-plan {:file "src/app/core.clj"
+                         :source mutual-recursion-source
+                         :forms '[even-step odd-step parity]
+                         :to "src/app/parity.clj"
+                         :target-ns "app.parity"}))
+
+(deftest test-compile-plan-writes-every-form-of-a-dependency-cycle
+  (let [plan (mutual-recursion-plan)
+        target (:_new-file-content plan)
+        index #(str/index-of target %)]
+    (is (nil? (:error plan)))
+    (testing "every selected form reaches the target"
+      (is (index "(defn even-step [n]"))
+      (is (index "(defn odd-step [n]"))
+      (is (index "(defn parity [n]")))
+    (testing "a form used before its definition is declared first"
+      (is (index "(declare odd-step)"))
+      (is (< (index "(declare odd-step)") (index "(defn even-step [n]"))))
+    (testing "the cycle keeps its source order, and its dependent follows it"
+      (is (< (index "(defn even-step [n]")
+             (index "(defn odd-step [n]")
+             (index "(defn parity [n]"))))
+    (is (some? (parser/parse-string-all target)))))
+
+(deftest test-compile-candidates-drops-moved-names-from-source-declares
+  (let [plan (mutual-recursion-plan)
+        {:keys [source]}
+        (extract/compile-candidates
+          {:source mutual-recursion-source
+           :source-file "src/app/core.clj"
+           :target-file "src/app/parity.clj"
+           :form-ranges (:_form-texts plan)
+           :target-source (:_new-file-content plan)
+           :target-ns (:target-ns plan)
+           :target-alias (:target-alias plan)
+           :source-referred-forms (:_source-referred-forms plan)})]
+    (is (str/includes? source "(declare later)"))
+    (is (not (str/includes? source "odd-step")))
+    (is (not (str/includes? source "(defn even-step")))
+    (is (str/includes? source "(defn later [] :later)"))))
+
+(deftest test-compile-candidates-removes-a-declare-that-names-only-moved-forms
+  (let [source (str "(ns app.core)\n\n"
+                    "(declare odd-step)\n\n"
+                    "(defn even-step [n]\n"
+                    "  (if (zero? n) true (odd-step (dec n))))\n\n"
+                    "(defn odd-step [n]\n"
+                    "  (if (zero? n) false (even-step (dec n))))\n\n"
+                    "(defn main [] (even-step 4))\n")
+        plan (extract/compile-plan {:file "src/app/core.clj"
+                                    :source source
+                                    :forms '[even-step odd-step]
+                                    :to "src/app/parity.clj"
+                                    :target-ns "app.parity"})
+        result (:source (extract/compile-candidates
+                          {:source source
+                           :source-file "src/app/core.clj"
+                           :target-file "src/app/parity.clj"
+                           :form-ranges (:_form-texts plan)
+                           :target-source (:_new-file-content plan)
+                           :target-ns (:target-ns plan)
+                           :target-alias (:target-alias plan)
+                           :source-referred-forms (:_source-referred-forms plan)}))]
+    (is (not (str/includes? result "declare")))
+    (is (not (str/includes? result "\n\n\n")))
+    (is (str/includes? result "(defn main [] (even-step 4))"))))
+
 (deftest test-execute-rolls-back-the-created-target-when-source-commit-fails
   (let [root (create-temp-project!)
         source (io/file root "src" "my" "app.clj")

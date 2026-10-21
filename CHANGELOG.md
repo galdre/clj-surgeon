@@ -21,6 +21,16 @@ is cut.
 
 ### Fixed
 
+- Extracting forms that call each other no longer deletes them. The
+  topological order omitted every form in a dependency cycle and every form
+  depending on one, so those forms were removed from the source but never
+  written to the target, while the result reported success. They now follow
+  the sorted forms in source order, with a `declare` for any form used before
+  its definition.
+
+- Extraction removes moved names from the source's `declare` forms, and
+  removes a `declare` left naming nothing.
+
 - CLI `:extract!` no longer writes a moved `defn-` that the source still
   calls. Without `:public-forms` it now makes every such form public, as the
   MCP route already did; an explicit `:public-forms` list that omits one
