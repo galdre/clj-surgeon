@@ -446,9 +446,13 @@
 
 (defn plan
   "Capture one workspace snapshot and delegate extraction decisions to
-  compile-plan. This is the filesystem shell, not the pure planner."
-  [{:keys [file forms to source-paths require-policy]
-    :or {require-policy :minimal}}]
+  compile-plan. This is the filesystem shell, not the pure planner.
+  Without :public-forms, every moved private form that remaining source still
+  calls is made public, as on the MCP route. An explicit :public-forms list is
+  used as given, and execute! refuses one that omits a required form."
+  [{:keys [file forms to source-paths require-policy public-forms]
+    :or {require-policy :minimal}
+    :as opts}]
   (try
     (let [source (slurp file)
           target-ns (file-path->ns-name to source-paths)
@@ -470,7 +474,9 @@
          :to to
          :target-ns target-ns
          :workspace-sources workspace-sources
-         :require-policy require-policy}))
+         :require-policy require-policy
+         :public-forms (vec public-forms)
+         :derive-required-public-forms (not (contains? opts :public-forms))}))
     (catch Exception error
       {:ok false
        :error-type :extraction-snapshot-failed
@@ -489,8 +495,20 @@
    source and removes the newly-created target."
   [{:keys [file to receipt-out] :as opts}]
   (let [p (plan opts)]
-    (if (:error p)
+    (cond
+      (:error p)
       p
+
+      (seq (:missing-required-public-forms p))
+      {:error "Every moved private form called by remaining source must be public"
+       :error-type :required-public-forms-missing
+       :required-public-forms (:required-public-forms p)
+       :missing-public-forms (:missing-required-public-forms p)
+       :next-step "Add the missing forms to :public-forms, or omit :public-forms to publicize every required form"
+       :source-unchanged true
+       :target-unchanged true}
+
+      :else
       (let [original-source (:_source p)
             original-source-hash (:_source-hash p)
             new-content (:_new-file-content p)
@@ -554,6 +572,7 @@
                    :omitted-target-requires (:omitted-target-requires p)
                    :remaining-source-callers (:remaining-source-callers p)
                    :source-referred-forms source-referred-forms
+                   :public-forms (:public-forms p)
                    :log (vec (concat
                                [{:action :create-file
                                  :file to

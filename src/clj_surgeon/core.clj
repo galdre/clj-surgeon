@@ -651,6 +651,7 @@
                        :args      {:file           {:required true :desc "Source file"}
                                    :forms          {:required true :desc "EDN vector of form names, e.g. '[foo bar]'"}
                                    :to             {:required true :desc "Target file path for new namespace"}
+                                   :public-forms   {:desc "EDN vector of moved private forms to make public. Omit it to publicize every moved private form that remaining source still calls"}
                                    :require-policy {:desc ":minimal (default) proves exact requires; :copy-all preserves the complete source ns header as a conservative starting point"}}
                        :examples  ["clj-surgeon :op :extract :file src/state.clj :forms '[distill refine]' :to src/distillery.clj"]
                        :category  :write
@@ -661,6 +662,7 @@
                        :args      {:file           {:required true :desc "Source file"}
                                    :forms          {:required true :desc "EDN vector of form names"}
                                    :to             {:required true :desc "New target file; existing files refuse"}
+                                   :public-forms   {:desc "EDN vector of moved private forms to make public. Omit it to publicize every moved private form that remaining source still calls; a list that omits one refuses"}
                                    :require-policy {:desc ":minimal (default) proves exact requires; :copy-all preserves the complete source ns header as a conservative starting point"}
                                    :receipt-out    {:desc "Optional new .edn path for a guarded inverse receipt"}}
                        :workflow  ["Run :extract first. Review target-requires, omitted-target-requires, remaining-source-callers, callers-to-review, and authority-labeled quoted-var-references. Unsupported require shapes refuse instead of copying or dropping unproved dependencies."

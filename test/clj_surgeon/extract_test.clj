@@ -410,6 +410,69 @@
         (is (= original-target (slurp target))))
       (finally (delete-recursive! root)))))
 
+;; Field failure (2026-10-21, invoice refactoring trial): `:extract!` moved a
+;; private `defn-` that the source still called. The new file kept `defn-`,
+;; so the source's call failed clj-kondo with "is private". The plan had
+;; already reported `:missing-required-public-forms`; the CLI executor wrote
+;; anyway. The MCP route derives the required public forms by default and
+;; refuses an explicit list that omits one; the CLI now does the same.
+(defn- create-private-caller-project!
+  "A minimized shape of the trial's billing.invoice namespace."
+  []
+  (let [root (java.io.File/createTempFile "extract-private" "")
+        _ (.delete root)
+        _ (.mkdirs root)
+        src-dir (io/file root "src" "billing")]
+    (.mkdirs src-dir)
+    (spit (io/file root "deps.edn") "{:paths [\"src\"]}\n")
+    (spit (io/file src-dir "invoice.clj")
+          (str "(ns billing.invoice\n"
+               "  (:require [clojure.string :as str]))\n\n"
+               "(defn- has-email? [customer]\n"
+               "  (not (str/blank? (:email customer))))\n\n"
+               "(defn- deliver! [customer]\n"
+               "  (when (has-email? customer)\n"
+               "    [:queued (:email customer)]))\n\n"
+               "(defn process [customer]\n"
+               "  (deliver! customer))\n"))
+    root))
+
+(deftest test-execute-publicizes-a-moved-private-form-that-the-source-still-calls
+  (let [root (create-private-caller-project!)
+        source (io/file root "src" "billing" "invoice.clj")
+        target (io/file root "src" "billing" "delivery.clj")]
+    (try
+      (let [result (extract/execute! {:file (.getPath source)
+                                      :forms '[deliver! has-email?]
+                                      :to (.getPath target)})
+            target-text (slurp target)]
+        (is (nil? (:error result)))
+        (testing "the form the source still calls becomes public"
+          (is (str/includes? target-text "(defn deliver! [customer]")))
+        (testing "a helper called only by moved forms stays private"
+          (is (str/includes? target-text "(defn- has-email? [customer]")))
+        (is (= ["deliver!"] (:public-forms result)))
+        (is (some? (parser/parse-string-all target-text))))
+      (finally (delete-recursive! root)))))
+
+(deftest test-execute-refuses-an-explicit-public-forms-list-that-omits-a-required-form
+  (let [root (create-private-caller-project!)
+        source (io/file root "src" "billing" "invoice.clj")
+        target (io/file root "src" "billing" "delivery.clj")
+        original-source (slurp source)]
+    (try
+      (let [result (extract/execute! {:file (.getPath source)
+                                      :forms '[deliver! has-email?]
+                                      :public-forms '[]
+                                      :to (.getPath target)})]
+        (is (= :required-public-forms-missing (:error-type result)))
+        (is (= ["deliver!"] (:missing-public-forms result)))
+        (is (true? (:source-unchanged result)))
+        (is (true? (:target-unchanged result)))
+        (is (= original-source (slurp source)))
+        (is (not (.exists target))))
+      (finally (delete-recursive! root)))))
+
 (deftest test-execute-rolls-back-the-created-target-when-source-commit-fails
   (let [root (create-temp-project!)
         source (io/file root "src" "my" "app.clj")
