@@ -84,3 +84,77 @@
                                    {:below "defmethod render :card"} {} block)]
       (is (str/includes? (:target r)
                          "(defmethod render :card [x] x)\n\n(defn moved [] :m)\n\n(defmethod render :list")))))
+
+;; ============================================================
+;; Requires and qualifier rewrites
+;; ============================================================
+
+(defn- merge-requires [source-ns target forms]
+  (move-into/merge-requires {:source-ns-form source-ns
+                             :target target
+                             :target-ns "app.target"
+                             :form-sources forms}))
+
+(deftest a-library-the-target-already-requires-adds-nothing
+  (let [r (merge-requires "(ns app.source (:require [clojure.string :as str]))"
+                          "(ns app.target (:require [clojure.string :as str]))\n"
+                          ["(defn f [s] (str/blank? s))"])]
+    (is (:ok r))
+    (is (= [] (:requires-added r)))
+    (is (= ["(defn f [s] (str/blank? s))"] (:form-sources r)))))
+
+(deftest a-missing-library-is-inserted-at-its-sorted-position
+  (let [r (merge-requires "(ns app.source (:require [b.lib :as b]))"
+                          (str "(ns app.target\n"
+                               "  (:require\n"
+                               "   [a.lib :as a]\n"
+                               "   [c.lib :as c]))\n")
+                          ["(defn f [] (b/g))"])]
+    (is (= ["b.lib"] (:requires-added r)))
+    (is (str/includes? (:target r) "[a.lib :as a]\n   [b.lib :as b]\n   [c.lib :as c]"))))
+
+(deftest a-target-with-no-require-clause-gets-one
+  (let [r (merge-requires "(ns app.source (:require [b.lib :as b]))"
+                          "(ns app.target)\n"
+                          ["(defn f [] (b/g))"])]
+    (is (str/includes? (:target r) "(:require\n   [b.lib :as b])"))))
+
+(deftest the-same-library-under-another-alias-rewrites-the-moved-qualifiers
+  (let [r (merge-requires "(ns app.source (:require [clojure.string :as str]))"
+                          "(ns app.target (:require [clojure.string :as string]))\n"
+                          ["(defn f [s] (str/blank? s))"])]
+    (is (= [] (:requires-added r)))
+    (is (= ["(defn f [s] (string/blank? s))"] (:form-sources r)))
+    (is (= [{:from "str/blank?" :to "string/blank?"}] (:qualifiers-rewritten r)))))
+
+(deftest the-same-alias-for-another-library-refuses
+  (let [r (merge-requires "(ns app.source (:require [clojure.string :as str]))"
+                          "(ns app.target (:require [my.strings :as str]))\n"
+                          ["(defn f [s] (str/blank? s))"])]
+    (is (= :alias-conflict (:error-type r)))
+    (is (= [{:alias "str" :source-namespace "clojure.string"
+             :target-namespace "my.strings"}]
+           (:conflicts r)))))
+
+(deftest calls-into-the-target-become-plain-names
+  (let [r (merge-requires "(ns app.source (:require [app.target :as customer]))"
+                          "(ns app.target)\n"
+                          [(str "(defn has-email? [c]\n"
+                                "  (and (::customer/active c) (customer/email c)))")])]
+    (is (= [] (:requires-added r)))
+    (is (= ["(defn has-email? [c]\n  (and (::active c) (email c)))"] (:form-sources r)))
+    (is (not (str/includes? (:target r) "app.target :as")))))
+
+(deftest a-referred-symbol-is-carried-into-a-new-libspec
+  (let [r (merge-requires "(ns app.source (:require [b.lib :refer [g h]]))"
+                          "(ns app.target)\n"
+                          ["(defn f [] (g))"])]
+    (is (= ["b.lib"] (:requires-added r)))
+    (is (str/includes? (:target r) "[b.lib :refer [g]]"))))
+
+(deftest a-referred-symbol-the-target-does-not-refer-refuses
+  (let [r (merge-requires "(ns app.source (:require [b.lib :refer [g]]))"
+                          "(ns app.target (:require [b.lib :as b]))\n"
+                          ["(defn f [] (g))"])]
+    (is (= :refer-merge-unsupported (:error-type r)))
+    (is (= [{:namespace "b.lib" :symbols ["g"]}] (:missing-refers r)))))

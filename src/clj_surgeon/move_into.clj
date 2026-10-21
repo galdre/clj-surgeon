@@ -6,9 +6,12 @@
    shell in clj-surgeon.extract reads the files, writes the result
    atomically, lints it, and rolls back on a new error."
   (:require
+   [clj-surgeon.cljc.require-ops :as require-ops]
+   [clj-surgeon.extract-header :as header]
    [clj-surgeon.forms :as forms]
    [clojure.string :as str]
    [rewrite-clj.node :as n]
+   [rewrite-clj.parser :as parser]
    [rewrite-clj.zip :as z]))
 
 ;; ============================================================
@@ -172,3 +175,142 @@
                        (str prefix block "\n\n" suffix))
               :at-end (str (with-final-newline (str/trimr target)) "\n" block "\n"))]
         {:ok true :target result :anchor resolved}))))
+
+;; ============================================================
+;; Requires and qualifier rewrites
+;; ============================================================
+
+(defn ns-form-source
+  "The source text of the ns form in `text`, or nil."
+  [text]
+  (some->> (z/of-string text)
+           (iterate z/right)
+           (take-while some?)
+           (filter #(and (z/list? %) (= "ns" (some-> % z/down z/string))))
+           first
+           z/string))
+
+(defn- rewrite-token [text rewrites]
+  (let [rewrite (fn [prefix local]
+                  (when (contains? rewrites prefix)
+                    (if-let [replacement (get rewrites prefix)]
+                      (str replacement "/" local)
+                      local)))]
+    (if-let [[_ prefix local] (re-matches #"::([^/]+)/(.+)" text)]
+      (some->> (rewrite prefix local) (str "::"))
+      (when-let [[_ prefix local] (re-matches #"([^:/][^/]*)/(.+)" text)]
+        (rewrite prefix local)))))
+
+(defn rewrite-qualifiers
+  "Rewrite qualified symbols and auto-resolved keywords in `source` whose
+  qualifier is a key of `rewrites`: to `new/local` when the value is a
+  string, to the plain local name when it is nil. Returns {:source :rewritten}."
+  [source rewrites]
+  (loop [loc (z/of-string source)
+         rewritten []]
+    (cond
+      (z/end? loc)
+      {:source (z/root-string loc) :rewritten rewritten}
+
+      (= :token (n/tag (z/node loc)))
+      (let [text (z/string loc)
+            replacement (rewrite-token text rewrites)]
+        (if replacement
+          (recur (z/next (z/replace loc (parser/parse-string replacement)))
+                 (conj rewritten {:from text :to replacement}))
+          (recur (z/next loc) rewritten)))
+
+      :else (recur (z/next loc) rewritten))))
+
+(defn merge-requires
+  "Make the target serve every require the moved forms use.
+
+  For each source libspec the moved forms use: a libspec for the target
+  namespace itself becomes plain names; a library the target already
+  requires under another alias rewrites the moved forms' qualifiers; a
+  missing library is inserted at its sorted position. Refuses an alias the
+  target binds to a different library, referred symbols the target does not
+  refer, and :rename or :refer :all libspecs."
+  [{:keys [source-ns-form target target-ns form-sources]}]
+  (let [source-specs (header/libspec-entries source-ns-form)
+        target-specs (header/libspec-entries (ns-form-source target))]
+    (cond
+      (not (:ok source-specs)) source-specs
+      (not (:ok target-specs)) (assoc target-specs :file :target)
+      :else
+      (let [free (set (header/form-free-symbols form-sources))
+            target-by-ns (into {} (map (juxt (comp str :namespace) identity))
+                               (:entries target-specs))
+            target-alias->ns (into {} (keep (fn [{:keys [alias namespace]}]
+                                              (when alias [(str alias) (str namespace)])))
+                                   (:entries target-specs))
+            used (filterv #(header/libspec-used? % form-sources) (:entries source-specs))
+            decisions
+            (for [{:keys [namespace alias referred renamed]} used
+                  :let [lib (str namespace)
+                        alias (some-> alias str)
+                        used-refers (when (vector? referred)
+                                      (filterv free (map str referred)))
+                        existing (get target-by-ns lib)
+                        existing-alias (some-> existing :alias str)]]
+              (cond
+                renamed {:unsupported {:namespace lib :reason :rename}}
+                (= :all referred) {:unsupported {:namespace lib :reason :refer-all}}
+                (= lib target-ns) {:rewrites (cond-> {lib nil} alias (assoc alias nil))}
+
+                existing
+                (let [target-refers (:referred existing)
+                      missing (if (= :all target-refers)
+                                []
+                                (vec (remove (set (map str target-refers)) used-refers)))]
+                  (cond-> {:rewrites (cond
+                                       (nil? alias) {}
+                                       (nil? existing-alias) {alias lib}
+                                       (not= alias existing-alias) {alias existing-alias}
+                                       :else {})}
+                    (seq missing) (assoc :missing-refers {:namespace lib :symbols missing})))
+
+                (and alias (contains? target-alias->ns alias))
+                {:conflict {:alias alias
+                            :source-namespace lib
+                            :target-namespace (get target-alias->ns alias)}}
+
+                :else
+                {:add {:namespace lib :alias alias :refers used-refers}}))
+            unsupported (keep :unsupported decisions)
+            conflicts (keep :conflict decisions)
+            missing-refers (keep :missing-refers decisions)]
+        (cond
+          (seq unsupported)
+          {:ok false
+           :error-type :unsupported-require
+           :error "A moved form uses a libspec shape that cannot be merged"
+           :libspecs (vec unsupported)}
+
+          (seq conflicts)
+          {:ok false
+           :error-type :alias-conflict
+           :error "The target binds an alias the moved forms use to a different library"
+           :conflicts (vec conflicts)
+           :next-step "Rename the alias in the source or the target, then move again"}
+
+          (seq missing-refers)
+          {:ok false
+           :error-type :refer-merge-unsupported
+           :error "The moved forms use referred symbols the target does not refer"
+           :missing-refers (vec missing-refers)}
+
+          :else
+          (let [rewrites (apply merge {target-ns nil} (keep :rewrites decisions))
+                results (mapv #(rewrite-qualifiers % rewrites) form-sources)
+                additions (keep :add decisions)
+                target' (reduce (fn [text {:keys [namespace alias refers]}]
+                                  (require-ops/insert-into-require-sorted
+                                    text (symbol namespace) alias refers))
+                                target
+                                additions)]
+            {:ok true
+             :target target'
+             :form-sources (mapv :source results)
+             :requires-added (mapv :namespace additions)
+             :qualifiers-rewritten (vec (distinct (mapcat :rewritten results)))}))))))
