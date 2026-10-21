@@ -281,3 +281,45 @@
                 "(ns app.target)\n" '[f] {:at-end true})]
     (is (= ["f"] (:public-forms r)))
     (is (str/includes? (:target r) "(defn f [] 1)"))))
+
+;; Field case (invoice trial): after has-email? moved to billing.customer,
+;; clojure.string was unused in billing.invoice and clj-kondo warned.
+(deftest a-require-only-the-moved-forms-used-leaves-the-source
+  (let [r (move (str "(ns app.source\n"
+                     "  (:require\n"
+                     "   [clojure.set :as set]\n"
+                     "   [clojure.string :as str]\n"
+                     "   [side.effects]))\n\n"
+                     "(defn f [s] (str/blank? s))\n\n"
+                     "(defn main [] [(f \"\") (set/union)])\n")
+                "(ns app.target)\n" '[f] {:at-end true})]
+    (is (= ["clojure.string"] (:requires-removed r)))
+    (is (not (str/includes? (:source r) "clojure.string")))
+    (testing "a require still used, and a bare side-effect require, stay"
+      (is (str/includes? (:source r) "[clojure.set :as set]"))
+      (is (str/includes? (:source r) "[side.effects]")))
+    (is (some? (parser/parse-string-all (:source r))))))
+
+(deftest a-require-clause-emptied-by-the-move-is-removed
+  (let [r (move (str "(ns app.source\n"
+                     "  (:require\n"
+                     "   [clojure.string :as str]))\n\n"
+                     "(defn f [s] (str/blank? s))\n")
+                "(ns app.target)\n" '[f] {:at-end true})]
+    (is (= "(ns app.source)\n" (:source r)))))
+
+(deftest several-unused-requires-are-all-removed
+  (let [r (move (str "(ns app.source\n"
+                     "  (:require\n"
+                     "   [a.lib :as a]\n"
+                     "   [b.lib :as b]\n"
+                     "   [c.lib :as c]\n"
+                     "   [d.lib :as d]))\n\n"
+                     "(defn f [] [(b/x) (d/y)])\n\n"
+                     "(defn main [] [(f) (a/z) (c/w)])\n")
+                "(ns app.target)\n" '[f] {:at-end true})]
+    (is (= ["b.lib" "d.lib"] (:requires-removed r)))
+    (is (str/includes? (:source r) (str "   [a.lib :as a]\n"
+                                        "   [app.target :as target :refer [f]]\n"
+                                        "   [c.lib :as c]))")))
+    (is (not (re-find #"[bd]\.lib" (:source r))))))

@@ -15,7 +15,8 @@ is cut.
   `--at-start` or `--at-end`. The plan merges requires at their sorted
   positions, rewrites the moved forms' qualifiers to the target's aliases
   (calls into the target become plain names), makes moved private forms the
-  source still calls public, and adds a `:refer` to the source. It refuses
+  source still calls public, adds a `:refer` to the source, and removes
+  source requires that only the moved forms used. It refuses
   unknown or ambiguous anchors, name clashes, symbols whose meaning would
   change, forms left behind that a moved form calls, alias conflicts and
   circular requires before writing. A new clj-kondo error after the write

@@ -109,7 +109,7 @@
                           :target-hash (structural-lens/source-hash target)})))))
 
 (defn- summary [result]
-  (select-keys result [:moved-forms :public-forms :declared :requires-added
+  (select-keys result [:moved-forms :public-forms :declared :requires-added :requires-removed
                        :qualifiers-rewritten :source-referred-forms :warnings
                        :callers-to-review :quoted-var-references]))
 

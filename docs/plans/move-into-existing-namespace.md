@@ -51,6 +51,13 @@ name.
   codebase inconsistent. Detecting a refusal before writing is the goal;
   rolling every file back is the fallback when that is not possible.
 
+### Requires left unused (answered 2026-10-21)
+
+A source libspec that only the moved forms used is removed, with the
+:require clause when it empties. A libspec with no alias and no refers may be
+loaded for its side effects and always stays. Field case: clojure.string in
+billing.invoice after has-email? moved.
+
 ### Anchors (answered 2026-10-21, decision page "Move Anchor Decisions")
 
 - **Named anchors** name only forms in clj-surgeon's definition list: core

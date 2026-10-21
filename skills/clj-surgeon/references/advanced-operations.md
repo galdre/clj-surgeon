@@ -63,7 +63,9 @@ clj-surgeon undo-extract! --receipt /tmp/move.edn
 The move adds missing target requires at their sorted positions, rewrites the
 moved forms' qualifiers to the target's aliases (`customer/email` becomes
 `email` inside `billing.customer`), makes moved private forms that the source
-still calls public, and adds a `:refer` for them to the source. It refuses
+still calls public, adds a `:refer` for them to the source, and removes
+source requires that only the moved forms used (never a bare libspec that may
+be loaded for side effects). It refuses
 before any write on: an anchor the definition list does not know (the refusal
 shows the `.clj-surgeon.edn` `:aliases` entry for an unrecognized macro), an
 ambiguous anchor (use a typed one such as `'defmethod render :card'`), a name

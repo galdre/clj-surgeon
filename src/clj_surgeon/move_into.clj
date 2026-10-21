@@ -466,6 +466,48 @@
           (require-ops/insert-into-require-sorted
             text (symbol target-ns) (header/allocate-alias target-ns aliases) refers))))))
 
+;; Requires the move leaves unused
+;; ------------------------------------------------------------
+
+(defn- remove-libspecs
+  "Remove the :require entries naming `namespaces`, and the :require clause
+  itself when nothing is left in it."
+  [text namespaces]
+  (let [doomed (set namespaces)
+        clause-loc (ns-clause (ns-zloc text) ":require")]
+    (loop [loc (some-> clause-loc z/down z/right)
+           clause clause-loc]
+      (cond
+        (nil? loc)
+        (if (some-> clause z/down z/right)
+          (z/root-string clause)
+          (-> clause z/remove z/root-string))
+
+        (and (z/vector? loc) (contains? doomed (some-> loc z/down z/string)))
+        ;; z/remove lands on the previous node depth-first, which may sit
+        ;; inside the previous libspec; climb back to the :require clause.
+        (let [clause' (loop [l (z/remove loc)]
+                        (if (and (z/list? l) (= ":require" (some-> l z/down z/string)))
+                          l
+                          (recur (z/up l))))]
+          (recur (some-> clause' z/down z/right) clause'))
+
+        :else (recur (z/right loc) clause)))))
+
+(defn- drop-unused-requires
+  "Remove source libspecs that only the moved forms used. A libspec with no
+  alias and no refers may be loaded for its side effects, so it stays."
+  [source' moved-texts]
+  (let [specs (:entries (header/libspec-entries (ns-form-source source')))
+        remaining [(str/replace-first source' (ns-form-source source') "")]
+        unused (->> specs
+                    (filter #(or (:alias %) (vector? (:referred %))))
+                    (filter #(header/libspec-used? % moved-texts))
+                    (remove #(header/libspec-used? % remaining))
+                    (mapv (comp str :namespace)))]
+    {:source (if (seq unused) (remove-libspecs source' unused) source')
+     :removed unused}))
+
 ;; ============================================================
 ;; Checks
 ;; ============================================================
@@ -635,9 +677,13 @@
                                           (cons (str "(declare " (str/join " " declared) ")"))))
                         placed (place-block (:target merged) anchor project-aliases block)
                         target' (:target placed)
-                        source' (-> (extract/source-without-forms source ordered)
-                                    (require-target-from-source
-                                      target-ns (:_source-referred-forms plan)))
+                        cleaned (drop-unused-requires
+                                  (extract/source-without-forms source ordered)
+                                  texts)
+                        source' (-> (require-target-from-source
+                                      (:source cleaned) target-ns (:_source-referred-forms plan))
+                                    str/trimr
+                                    (str "\n"))
                         graph (into {}
                                     (map (fn [text]
                                            [(some-> (ns-zloc text) z/down z/right z/string)
@@ -684,6 +730,7 @@
                          :public-forms (:public-forms plan)
                          :declared declared
                          :requires-added (:requires-added merged)
+                         :requires-removed (:removed cleaned)
                          :qualifiers-rewritten (:qualifiers-rewritten merged)
                          :source-referred-forms (:_source-referred-forms plan)
                          :warnings warnings
