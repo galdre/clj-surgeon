@@ -302,6 +302,25 @@
   [type-str]
   (= :defn- (classify type-str)))
 
+(defn defined-vars
+  "Names of the Vars a top-level form defines besides its own name: a
+   protocol's methods, a record's ->Name and map->Name, a type's ->Name.
+   `form` is the form's s-expression."
+  [form]
+  (if-not (seq? form)
+    []
+    (let [[head form-name & body] form]
+      (case (some-> head str classify)
+        :defprotocol (vec (keep #(when (and (seq? %) (symbol? (first %))) (str (first %))) body))
+        :defrecord [(str "->" form-name) (str "map->" form-name)]
+        :deftype [(str "->" form-name)]
+        []))))
+
+(defn defines-class?
+  "Does this form type define a JVM class callers may import?"
+  [type-str]
+  (#{:defrecord :deftype} (classify type-str)))
+
 (defn has-arglists?
   "Does this form type have an arglist vector? (defn, defn-, >defn, mu/defn, etc.)
    Used by the default extract-arglist path — when a project alias provides

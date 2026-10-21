@@ -161,6 +161,10 @@
 
 (declare free-symbols*)
 
+(def ^:private ^:dynamic *probe-hits*
+  "While locals-at runs: an atom of {probe-name locals-in-scope}."
+  nil)
+
 (defn- free-symbols-many [forms bound]
   (reduce into #{} (map #(free-symbols* % bound) forms)))
 
@@ -256,7 +260,12 @@
   [form bound]
   (cond
     (symbol? form)
-    (if (contains? bound (str form)) #{} #{(str form)})
+    (do
+      (when *probe-hits*
+        (swap! *probe-hits*
+               #(cond-> (update % ::seen into bound)
+                  (contains? % (str form)) (assoc (str form) bound))))
+      (if (contains? bound (str form)) #{} #{(str form)}))
 
     (map? form)
     (free-symbols-many (concat (keys form) (vals form)) bound)
@@ -317,6 +326,19 @@
           (free-symbols-many form bound))))
 
     :else #{}))
+
+(defn locals-at
+  "For each probe symbol name in `probes`, the local names in scope where it
+  occurs in the s-expression `form`, by the same lexical analysis as
+  free-symbols-in-form; nil for a probe that does not occur. :known-locals
+  holds every local the analysis saw in scope anywhere in the form."
+  [form probes]
+  (let [hits (atom (assoc (zipmap probes (repeat nil)) ::seen #{}))]
+    (binding [*probe-hits* hits]
+      (free-symbols* form #{}))
+    (-> @hits
+        (assoc :known-locals (::seen @hits))
+        (dissoc ::seen))))
 
 (defn free-symbols-in-form
   "Return free symbol names referenced by a form, excluding locals and quoted

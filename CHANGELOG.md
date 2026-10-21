@@ -22,12 +22,19 @@ is cut.
   circular requires before writing. Callers in other files are rewritten in
   the same move: aliased references through the caller's alias for the
   target, fully qualified references and var quotes with the new namespace,
-  and referred names on the target libspec; requires are added at their
-  sorted positions and removed when a rewrite leaves them unused. A reference
+  and referred or renamed names on the target libspec (`:refer :all` and
+  `:use` callers gain a refer); references inside reader conditionals are
+  rewritten when the target is `.cljc`; requires are added at their sorted
+  positions and removed when a rewrite leaves them unused. A reference
   that cannot be rewritten exactly refuses with `:caller-not-rewritable`.
   Callers are found under the declared source roots, or `--source-roots`.
-  Every file is hash-fenced; a new clj-kondo error in any written file
-  restores them all, and `undo-extract!` restores them all from the receipt.
+  Moving a protocol moves its methods, and moving a record or type moves
+  its constructors. The plan refuses a call that would become a plain name
+  a local captures, a moved name that would shadow a `clojure.core` Var the
+  target refers, and an import of a moved record class. Every file is
+  hash-fenced; a new clj-kondo error or unresolved reference in any written
+  file restores them all, and `undo-extract!` restores them all from the
+  receipt.
   Plan: `docs/plans/move-into-existing-namespace.md`.
 
 - The CLI accepts GNU-style arguments: `clj-surgeon ls --file src/a.clj`,

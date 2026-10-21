@@ -3,6 +3,7 @@
   atomic writes, lint rollback, receipts and undo. The planner itself is
   covered by move-into-test with literal sources."
   (:require
+   [babashka.fs :as fs]
    [clj-surgeon.move-into-shell :as shell]
    [clojure.java.io :as io]
    [clojure.string :as str]
@@ -221,3 +222,54 @@
             (is (:files-unchanged r)))))
       (is (str/includes? (slurp build-copy) "inv/has-email?"))
       (finally (delete-recursive! root)))))
+
+;; Verification gate 3 of the plan: clj-kondo is clean on the field
+;; regression's results, through the real linter rather than a stub.
+(deftest the-field-move-lints-clean-with-the-real-clj-kondo
+  (if-not (fs/which "clj-kondo")
+    (println "SKIPPED the-field-move-lints-clean-with-the-real-clj-kondo: missing executable clj-kondo")
+    (let [root (invoice-project-with-test!)
+          files (mapv #(io/file root %) ["src/billing/customer.clj" "src/billing/invoice.clj"
+                                         "test/billing/invoice_test.clj"])]
+      (try
+        (let [result (shell/execute! (dissoc (opts root) :lint))]
+          (is (:applied result))
+          (is (= {:checked true :files 3 :new-errors 0} (:lint result)))
+          (is (= [] (->> (:findings (shell/clj-kondo-lint files))
+                         (filter #(= :error (keyword (:level %))))
+                         (mapv #(select-keys % [:filename :row :message]))))))
+        (finally (delete-recursive! root))))))
+
+;; Eval-side report (2026-10-21): clj-kondo reports a dangling qualified
+;; reference (ns/missing) as a warning, so counting only :error findings let a
+;; move that leaves one through.
+(deftest unresolved-references-block-at-any-level
+  (let [finding (fn [type level] {:filename "src/a.clj" :row 3 :type type :level level
+                                  :message (str type)})]
+    (is (= [:unresolved-var :unresolved-namespace :unresolved-symbol :syntax]
+           (mapv :type (shell/new-blocking-findings
+                         [(finding :unused-binding :warning)]
+                         [(finding :unused-binding :warning)
+                          (finding :unresolved-var :warning)
+                          (finding :unresolved-namespace :warning)
+                          (finding :unresolved-symbol :error)
+                          (finding :syntax :error)
+                          (finding :redundant-do :warning)]))))
+    (testing "a finding the baseline already had does not block"
+      (is (= [] (shell/new-blocking-findings [(finding :unresolved-var :warning)]
+                                             [(finding :unresolved-var :warning)]))))))
+
+(deftest clj-kondo-reports-a-dangling-qualified-reference
+  (if-not (fs/which "clj-kondo")
+    (println "SKIPPED clj-kondo-reports-a-dangling-qualified-reference: missing executable clj-kondo")
+    (let [root (doto (java.io.File/createTempFile "move-into-kondo" "") .delete .mkdirs)
+          a (io/file root "app" "a.clj")
+          b (io/file root "app" "b.clj")]
+      (try
+        (.mkdirs (.getParentFile a))
+        (spit a "(ns app.a)\n\n(defn present [] 1)\n")
+        (spit b "(ns app.b\n  (:require [app.a :as a]))\n\n(defn f [] [(a/present) (a/moved-away)])\n")
+        (is (= [{:type :unresolved-var :message "Unresolved var: a/moved-away"}]
+               (mapv #(select-keys % [:type :message])
+                     (shell/new-blocking-findings [] (:findings (shell/clj-kondo-lint [a b]))))))
+        (finally (delete-recursive! root))))))

@@ -254,10 +254,10 @@
                 "(ns app.target)\n"
                 '[f] {:at-end true}
                 :workspace-sources
-                {"src/app/a.clj" "(ns app.a\n  (:require [app.source :refer :all]))\n\n(defn g [] (f))\n"
+                {"src/app/a.clj" "(ns app.a)\n\n(defn g []\n  (require 'app.source)\n  ((resolve 'app.source/f)))\n"
                  "src/app/b.cljs" "(ns app.b\n  (:require [app.source :as s]))\n\n(defn g [] (s/f))\n"})]
     (is (= :caller-not-rewritable (:error-type r)))
-    (is (= [{:file "src/app/a.clj" :line 4 :reason :refer-all :text "f"}
+    (is (= [{:file "src/app/a.clj" :line 4 :reason :runtime-require :text "app.source"}
             {:file "src/app/b.cljs" :line 4 :reason :target-platform :text "s/f"}]
            (:references r)))
     (is (:files-unchanged r))))
@@ -378,3 +378,96 @@
                                         "   [app.target :as target :refer [f]]\n"
                                         "   [c.lib :as c]))")))
     (is (not (re-find #"[bd]\.lib" (:source r))))))
+
+;; Eval-side report (2026-10-21): customer/email became the plain email inside
+;; a {:keys [email]} destructuring, so the moved form called the local string.
+(deftest a-qualifier-rewrite-a-local-would-capture-refuses
+  (let [r (move (str "(ns app.source\n  (:require [app.target :as t]))\n\n"
+                     "(defn f [{:keys [g] :as m}] (and g (t/g m)))\n")
+                "(ns app.target)\n\n(defn g [m] (:g m))\n"
+                '[f] {:at-end true})]
+    (is (= :meaning-change (:error-type r)))
+    (is (= [{:symbol "g" :from "t/g" :form "f"}] (:captures r)))))
+
+(deftest a-qualifier-rewrite-outside-any-local-still-becomes-plain
+  (let [r (move (str "(ns app.source\n  (:require [app.target :as t]))\n\n"
+                     "(defn f [m] (let [x 1] (t/g m x)))\n")
+                "(ns app.target)\n\n(defn g [m x] [m x])\n"
+                '[f] {:at-end true})]
+    (is (:ok r))
+    (is (str/includes? (:target r) "(let [x 1] (g m x))"))))
+
+(deftest a-quoted-call-into-the-target-stays-fully-qualified
+  (let [r (move (str "(ns app.source\n  (:require [app.target :as t]))\n\n"
+                     "(defn f [] [(t/g) (requiring-resolve 't/g)])\n")
+                "(ns app.target)\n\n(defn g [] 1)\n"
+                '[f] {:at-end true})]
+    (is (:ok r))
+    (is (str/includes? (:target r) "[(g) (requiring-resolve 'app.target/g)]"))))
+
+;; ============================================================
+;; Forms that define more than their name (eval-side report, 2026-10-21:
+;; protocol methods)
+;; ============================================================
+
+(def ^:private protocol-source
+  (str "(ns app.source)\n\n"
+       "(defprotocol Shape\n  (area [this])\n  (perimeter [this]))\n\n"
+       "(defn main [x] (area x))\n"))
+
+(deftest moving-a-protocol-moves-its-methods
+  (let [r (move protocol-source "(ns app.target)\n" '[Shape] {:at-end true}
+                :workspace-sources
+                {"src/app/use.clj" (str "(ns app.use\n  (:require [app.source :as s]))\n\n"
+                                        "(defn f [x] [(s/area x) (s/main x)])\n")})]
+    (is (:ok r))
+    (testing "the source refers the methods its remaining forms call"
+      (is (str/includes? (:source r) "[app.target :as target :refer [area]]")))
+    (testing "callers of a method are rewritten"
+      (is (str/includes? (get-in r [:callers "src/app/use.clj"]) "[(target/area x) (s/main x)]")))))
+
+(deftest moving-a-record-moves-its-constructors
+  (let [source (str "(ns app.source)\n\n(defrecord Circle [r])\n\n(defn main [] (->Circle 1))\n")
+        r (move source "(ns app.target)\n" '[Circle] {:at-end true}
+                :workspace-sources
+                {"src/app/use.clj" (str "(ns app.use\n  (:require [app.source :as s]))\n\n"
+                                        "(defn f [] [(s/->Circle 1) (s/map->Circle {:r 1})])\n")})]
+    (is (:ok r))
+    (is (str/includes? (:source r) ":refer [->Circle]"))
+    (is (str/includes? (get-in r [:callers "src/app/use.clj"])
+                       "[(target/->Circle 1) (target/map->Circle {:r 1})]"))))
+
+(deftest a-caller-importing-a-moved-record-class-refuses
+  (let [r (move "(ns app.source)\n\n(defrecord Circle [r])\n" "(ns app.target)\n" '[Circle] {:at-end true}
+                :workspace-sources
+                {"src/app/use.clj" (str "(ns app.use\n  (:import [app.source Circle]))\n\n"
+                                        "(defn f [^Circle c] (.r c))\n")})]
+    (is (= :caller-not-rewritable (:error-type r)))
+    (is (= [{:file "src/app/use.clj" :line 2 :reason :class-import :text "Circle"}]
+           (:references r)))))
+
+(deftest a-moved-form-calling-a-method-of-a-protocol-left-behind-refuses
+  (let [r (move protocol-source "(ns app.target)\n" '[main] {:at-end true})]
+    (is (= :left-behind-dependencies (:error-type r)))
+    (is (= [{:form "main" :calls ["area"]}] (:left-behind r)))
+    (is (= ["Shape" "main"] (:suggested-forms r)))))
+
+(deftest a-moved-name-that-a-target-protocol-defines-clashes
+  (let [r (move "(ns app.source)\n\n(defn area [x] x)\n"
+                "(ns app.target)\n\n(defprotocol Shape (area [this]))\n"
+                '[area] {:at-end true})]
+    (is (= :name-clash (:error-type r)))
+    (is (= ["area"] (:names r)))))
+
+;; Eval-side report (2026-10-21): shadowing clojure.core.
+(deftest a-moved-name-that-shadows-clojure-core-in-the-target-refuses
+  (let [source "(ns app.source\n  (:refer-clojure :exclude [update]))\n\n(defn update [m] (assoc m :updated true))\n"]
+    (testing "the target still refers clojure.core/update"
+      (let [r (move source "(ns app.target)\n\n(defn bump [m] (update m :n inc))\n"
+                    '[update] {:at-end true})]
+        (is (= :name-clash (:error-type r)))
+        (is (= {"update" "clojure.core/update"} (:core-names r)))))
+    (testing "a target that already excludes it accepts the move"
+      (let [r (move source "(ns app.target\n  (:refer-clojure :exclude [update]))\n"
+                    '[update] {:at-end true})]
+        (is (:ok r))))))

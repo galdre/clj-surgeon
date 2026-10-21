@@ -278,44 +278,108 @@
              :text "inv/has-email?"}]
            (:problems r)))))
 
-(deftest open-shapes-refuse-until-decided
-  (testing ":refer :all with the moved name spelled"
+;; ============================================================
+;; Other caller shapes (decision page "Move Into: Caller Shapes")
+;; ============================================================
+
+(deftest refer-all-gains-a-refer-of-the-moved-name
+  (testing ":refer :all stays; the moved name is referred from the target"
     (let [r (rewrite (str "(ns billing.report\n"
-                          "  (:require [billing.invoice :refer :all]))\n\n"
-                          "(defn row [c] (has-email? c))\n"))]
-      (is (= [:refer-all] (mapv :reason (:problems r))))))
-  (testing ":refer :all without the name is not a caller"
-    (is (false? (:changed (rewrite (str "(ns billing.report\n"
-                                        "  (:require [billing.invoice :refer :all]))\n\n"
-                                        "(defn row [c] (total c))\n"))))))
-  (testing ":use"
+                          "  (:require\n"
+                          "   [billing.invoice :refer :all]))\n\n"
+                          "(defn row [c] [(has-email? c) (total c)])\n"))]
+      (is (= (str "(ns billing.report\n"
+                  "  (:require\n"
+                  "   [billing.customer :refer [has-email?]]\n"
+                  "   [billing.invoice :refer :all]))\n\n"
+                  "(defn row [c] [(has-email? c) (total c)])\n")
+             (:text r)))))
+  (testing ":use stays the same way"
     (let [r (rewrite (str "(ns billing.report\n"
                           "  (:use billing.invoice))\n\n"
                           "(defn row [c] (has-email? c))\n"))]
-      (is (= [:refer-all] (mapv :reason (:problems r))))))
-  (testing ":rename of a moved name"
+      (is (= (str "(ns billing.report\n"
+                  "  (:use billing.invoice)\n"
+                  "  (:require\n"
+                  "   [billing.customer :refer [has-email?]]))\n\n"
+                  "(defn row [c] (has-email? c))\n")
+             (:text r)))))
+  (testing ":refer :all without the name is not a caller"
+    (is (false? (:changed (rewrite (str "(ns billing.report\n"
+                                        "  (:require [billing.invoice :refer :all]))\n\n"
+                                        "(defn row [c] (total c))\n")))))))
+
+(deftest a-rename-moves-to-the-target-libspec
+  (let [r (rewrite (str "(ns billing.report\n"
+                        "  (:require\n"
+                        "   [billing.invoice :refer [has-email? total] :rename {has-email? email?}]))\n\n"
+                        "(defn row [c] [(email? c) (total c)])\n"))]
+    (is (= (str "(ns billing.report\n"
+                "  (:require\n"
+                "   [billing.customer :refer [has-email?] :rename {has-email? email?}]\n"
+                "   [billing.invoice :refer [total]]))\n\n"
+                "(defn row [c] [(email? c) (total c)])\n")
+           (:text r))))
+  (testing "a rename the file no longer uses is dropped"
     (let [r (rewrite (str "(ns billing.report\n"
+                          "  (:require\n"
+                          "   [billing.invoice :as inv :refer [has-email?] :rename {has-email? email?}]))\n\n"
+                          "(defn row [c] (inv/total c))\n"))]
+      (is (str/includes? (:text r) "[billing.invoice :as inv]))"))))
+  (testing "in the target, a renamed use would need scope analysis, so it refuses"
+    (let [r (rewrite (str "(ns billing.customer\n"
                           "  (:require [billing.invoice :refer [has-email?] :rename {has-email? email?}]))\n\n"
-                          "(defn row [c] (email? c))\n"))]
-      (is (= [:rename] (mapv :reason (:problems r))))))
-  (testing "a reference inside a reader conditional"
-    (let [r (rewrite (str "(ns billing.report\n"
-                          "  (:require [billing.invoice :as inv]))\n\n"
-                          "(defn row [c] #?(:clj (inv/has-email? c) :cljs nil))\n")
-                     :file "src/billing/report.cljc"
-                     :target-file "src/billing/customer.cljc")]
-      (is (= [:reader-conditional] (mapv :reason (:problems r))))))
-  (testing "a prefix-list require hides the alias, so any spelling of the name refuses"
-    (let [r (rewrite (str "(ns billing.report\n"
-                          "  (:require (billing [invoice :as inv])))\n\n"
-                          "(defn row [c] (inv/has-email? c))\n"))]
-      (is (= [:prefix-list] (mapv :reason (:problems r))))))
-  (testing "a require call outside the ns form"
-    (let [r (rewrite (str "(ns billing.report)\n\n"
-                          "(comment\n"
-                          "  (require '[billing.invoice :as inv])\n"
-                          "  (inv/has-email? {}))\n"))]
-      (is (= [:runtime-require] (mapv :reason (:problems r)))))))
+                          "(defn row [c] (email? c))\n")
+                     :file "src/billing/customer.clj"
+                     :mode :target)]
+      (is (= [:rename] (mapv :reason (:problems r)))))))
+
+;; Field case (a large open-source codebase): moving app.util/lower-case-en
+;; refused only on references like this one, in .cljc callers.
+(deftest a-reference-in-a-reader-conditional-is-rewritten-when-the-target-serves-the-caller
+  (let [text (str "(ns billing.report\n"
+                  "  (:require [billing.invoice :as inv]))\n\n"
+                  "(defn row [c] #?(:clj (inv/has-email? c) :cljs nil))\n")]
+    (testing "a .cljc target serves both platforms"
+      (let [r (rewrite text :file "src/billing/report.cljc" :target-file "src/billing/customer.cljc")]
+        (is (str/includes? (:text r) "#?(:clj (customer/has-email? c) :cljs nil)"))
+        (is (str/includes? (:text r) "[billing.customer :as customer]"))))
+    (testing "a .clj target cannot serve a .cljc caller"
+      (let [r (rewrite text :file "src/billing/report.cljc" :target-file "src/billing/customer.clj")]
+        (is (= [:target-platform] (mapv :reason (:problems r))))))))
+
+(deftest a-source-libspec-in-a-reader-conditional-refuses
+  (let [r (rewrite (str "(ns billing.report\n"
+                        "  (:require #?(:clj [billing.invoice :as inv])))\n\n"
+                        "(defn row [c] (inv/has-email? c))\n")
+                   :file "src/billing/report.cljc"
+                   :target-file "src/billing/customer.cljc")]
+    (is (= [:reader-conditional] (mapv :reason (:problems r))))))
+
+(deftest a-prefix-list-require-hides-the-alias-and-refuses
+  (let [r (rewrite (str "(ns billing.report\n"
+                        "  (:require (billing [invoice :as inv])))\n\n"
+                        "(defn row [c] (inv/has-email? c))\n"))]
+    (is (= [:prefix-list] (mapv :reason (:problems r))))))
+
+(deftest a-runtime-require-in-a-comment-form-is-left-with-a-warning
+  (let [text (str "(ns billing.report)\n\n"
+                  "(comment\n"
+                  "  (require '[billing.invoice :as inv])\n"
+                  "  (inv/has-email? {}))\n")
+        r (rewrite text)]
+    (is (:ok r))
+    (is (= text (:text r)))
+    (is (= [{:type :runtime-require-in-comment :file "src/billing/report.clj" :line 4}]
+           (:warnings r)))))
+
+(deftest a-runtime-require-outside-a-comment-form-refuses
+  (let [r (rewrite (str "(ns user)\n\n"
+                        "(defn load-billing! []\n"
+                        "  (require '[billing.invoice :as inv])\n"
+                        "  ((resolve 'inv/has-email?) {}))\n")
+                   :file "dev/user.clj")]
+    (is (= [:runtime-require] (mapv :reason (:problems r))))))
 
 (deftest a-file-with-no-ns-form-that-calls-a-moved-form-refuses
   ;; A script loaded with load-file: there is no ns form to add the require to.
@@ -343,3 +407,59 @@
     (is (nil? (callers/leading-ns-text "(defn f [])\n(ns a)\n")))
     (is (nil? (callers/leading-ns-text "(ns a (:require [b]")))
     (is (nil? (callers/leading-ns-text "(nsx a)")))))
+
+;; ============================================================
+;; Local capture (eval-side report, 2026-10-21: capture through locals on
+;; rename and extract)
+;; ============================================================
+
+(deftest a-plain-name-a-local-would-capture-refuses-in-the-target
+  (testing "a parameter with the moved name"
+    (let [r (rewrite (str "(ns billing.customer\n"
+                          "  (:require [billing.invoice :as inv]))\n\n"
+                          "(defn check [has-email?] (inv/has-email? has-email?))\n")
+                     :file "src/billing/customer.clj"
+                     :mode :target)]
+      (is (= [{:file "src/billing/customer.clj" :line 4 :reason :local-capture
+               :text "inv/has-email?"}]
+             (:problems r)))))
+  (testing ":keys, :strs and namespaced :keys destructuring bind the name too"
+    (doseq [binding ["{:keys [has-email?]}" "{:strs [has-email?]}" "{:billing/keys [has-email?]}"
+                     "[_ has-email?]" "{has-email? :x}"]]
+      (let [r (rewrite (str "(ns billing.customer\n"
+                            "  (:require [billing.invoice :as inv]))\n\n"
+                            "(defn check [m] (let [" binding " m] (inv/has-email? m)))\n")
+                       :file "src/billing/customer.clj"
+                       :mode :target)]
+        (is (= [:local-capture] (mapv :reason (:problems r))) binding))))
+  (testing "a binding form the analysis does not model (a record field) counts as capture"
+    (let [r (rewrite (str "(ns billing.customer\n"
+                          "  (:require [billing.invoice :as inv]))\n\n"
+                          "(defrecord Check [has-email?] Object (toString [_] (str (inv/has-email? {}))))\n")
+                     :file "src/billing/customer.clj"
+                     :mode :target)]
+      (is (= [:local-capture] (mapv :reason (:problems r))))))
+  (testing "a local outside the reference's scope does not capture"
+    (let [r (rewrite (str "(ns billing.customer\n"
+                          "  (:require [billing.invoice :as inv]))\n\n"
+                          "(defn check [m] [(let [has-email? 1] has-email?) (inv/has-email? m)])\n")
+                     :file "src/billing/customer.clj"
+                     :mode :target)]
+      (is (:ok r))
+      (is (str/includes? (:text r) "(has-email? m)")))))
+
+(deftest capture-probes-report-the-locals-in-scope
+  (is (= {"__p1__" #{"email" "c"} "__p2__" #{}}
+         (callers/locals-at-probes
+           "(defn f [{:keys [email] :as c}] (__p1__ c)) (defn g [] (__p2__))"
+           ["__p1__" "__p2__"]))))
+
+;; Eval-side report (2026-10-21): an analysis reported one call twice, and
+;; applying both mangled a4/f4 into a4/volume-discountlume-discount.
+(deftest a-token-planned-twice-is-replaced-once
+  (let [splice #'callers/apply-replacements
+        r {:line 1 :col 2 :end-col 7 :from "a4/f4" :to "a4/volume-discount"}]
+    (is (= "(a4/volume-discount x)" (splice "(a4/f4 x)" [r r])))
+    (testing "overlapping ranges refuse instead of mangling"
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"overlap"
+            (splice "(a4/f4 x)" [r (assoc r :col 3 :end-col 7 :from "4/f4")]))))))

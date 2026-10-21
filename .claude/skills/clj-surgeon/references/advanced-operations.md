@@ -76,14 +76,22 @@ circular require. Callers in other files are rewritten in the same move:
 `inv/has-email?` takes the caller's alias for the target (one is added when
 missing), `billing.invoice/has-email?` and `#'billing.invoice/has-email?`
 keep their fully qualified spelling, and a referred name moves to a `:refer`
-on the target libspec. Requires that a rewrite leaves unused are removed. The
-target's own calls through the source become plain names. Callers are found
-under the declared source roots; pass `--source-roots '["src" "test"]'` to
-scan other directories. `:caller-not-rewritable` names each file, line and
-reason (`:refer-all`, `:rename`, `:reader-conditional`, `:prefix-list`,
-`:runtime-require`, `:target-platform`, `:no-ns-form`, `:unparsable`).
-Every file is hash-fenced, and a new clj-kondo error in any written file
-restores them all. Warnings name moved unqualified `::` keywords, moved forms
+on the target libspec, with its `:rename` entry; a `:refer :all` or `:use`
+caller gains a refer of the moved name. References inside reader
+conditionals are rewritten when the target is `.cljc`. Requires that a
+rewrite leaves unused are removed. The target's own calls through the source
+become plain names. Callers are found under the declared source roots; pass
+`--source-roots '["src" "test"]'` to scan other directories.
+`:caller-not-rewritable` names each file, line and reason (`:prefix-list` or
+`:reader-conditional` for a source libspec whose alias cannot be read,
+`:runtime-require` outside a `comment` form, `:target-platform`, `:rename`
+in the target itself, `:no-ns-form`, `:unparsable`). A `require` of the
+source inside a `comment` form is left unchanged with a warning. Moving a
+protocol moves its methods; moving a record or type moves its constructors.
+A call that would become a plain name a local captures refuses, as does a
+moved name that would shadow a `clojure.core` Var the target refers.
+Every file is hash-fenced, and a new clj-kondo error or unresolved reference
+in any written file restores them all. Warnings name moved unqualified `::` keywords, moved forms
 placed above a target form they call, and rewritten alias-qualified quoted
 symbols (`'inv/has-email?`), which resolve through whatever namespace is
 current at run time.

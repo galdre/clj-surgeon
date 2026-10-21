@@ -54,6 +54,12 @@
                        {:keys [row end-row]} (meta (z/node zloc))]
                    {:type (some-> head z/string)
                     :name (token-string name-loc)
+                    :vars (if (#{:defprotocol :defrecord :deftype}
+                               (forms/classify (some-> head z/string)))
+                            (try (forms/defined-vars
+                                   (n/sexpr (z/node zloc) {:auto-resolve (fn [a] (symbol (str a)))}))
+                                 (catch Exception _ []))
+                            [])
                     :name-symbol? (and (some? name-loc)
                                        (symbol? (try (z/sexpr name-loc)
                                                      (catch Exception _ nil))))
@@ -205,26 +211,59 @@
       (when-let [[_ prefix local] (re-matches #"([^:/][^/]*)/(.+)" text)]
         (rewrite prefix local)))))
 
+(defn- quoted?
+  "Is the location inside a quote, with no syntax quote nearer?"
+  [loc]
+  (some (fn [a]
+          (let [tag (n/tag (z/node a))]
+            (cond
+              (= :quote tag) true
+              (= :syntax-quote tag) false
+              (and (z/list? a) (= "quote" (some-> a z/down z/string))) true
+              :else nil)))
+        (take-while some? (iterate z/up (z/up loc)))))
+
 (defn rewrite-qualifiers
   "Rewrite qualified symbols and auto-resolved keywords in `source` whose
   qualifier is a key of `rewrites`: to `new/local` when the value is a
-  string, to the plain local name when it is nil. Returns {:source :rewritten}."
-  [source rewrites]
-  (loop [loc (z/of-string source)
-         rewritten []]
-    (cond
-      (z/end? loc)
-      {:source (z/root-string loc) :rewritten rewritten}
+  string, to the plain local name when it is nil. A quoted symbol becomes
+  `self-ns/local` instead of a plain name, since a quoted plain symbol
+  resolves against whatever namespace is current at run time. A plain name
+  that a local would capture is not written; it is listed under :captures.
+  Returns {:source :rewritten :captures}."
+  ([source rewrites] (rewrite-qualifiers source rewrites nil))
+  ([source rewrites self-ns]
+   (loop [loc (z/of-string source)
+          rewritten []
+          probes {}]
+     (cond
+       (z/end? loc)
+       (let [text (z/root-string loc)
+             captured (when (seq probes)
+                        (move-callers/capture-check text (update-vals probes :to)))]
+         {:source (reduce (fn [t [probe {:keys [to]}]] (str/replace t probe to)) text probes)
+          :rewritten rewritten
+          :captures (vec (for [[probe {:keys [from to]}] (sort-by key probes)
+                               :when (contains? captured probe)]
+                           {:symbol to :from from}))})
 
-      (= :token (n/tag (z/node loc)))
-      (let [text (z/string loc)
-            replacement (rewrite-token text rewrites)]
-        (if replacement
-          (recur (z/next (z/replace loc (parser/parse-string replacement)))
-                 (conj rewritten {:from text :to replacement}))
-          (recur (z/next loc) rewritten)))
+       (= :token (n/tag (z/node loc)))
+       (let [text (z/string loc)
+             replacement (rewrite-token text rewrites)
+             plain-symbol? (and replacement
+                                (not (str/starts-with? text ":"))
+                                (not (str/includes? replacement "/")))
+             [replacement probe] (cond
+                                   (not plain-symbol?) [replacement nil]
+                                   (and self-ns (quoted? loc)) [(str self-ns "/" replacement) nil]
+                                   :else [replacement (move-callers/probe-name (count probes))])]
+         (if replacement
+           (recur (z/next (z/replace loc (parser/parse-string (or probe replacement))))
+                  (conj rewritten {:from text :to replacement})
+                  (cond-> probes probe (assoc probe {:from text :to replacement})))
+           (recur (z/next loc) rewritten probes)))
 
-      :else (recur (z/next loc) rewritten))))
+       :else (recur (z/next loc) rewritten probes)))))
 
 (defn merge-requires
   "Make the target serve every require the moved forms use.
@@ -235,7 +274,7 @@
   missing library is inserted at its sorted position. Refuses an alias the
   target binds to a different library, referred symbols the target does not
   refer, and :rename or :refer :all libspecs."
-  [{:keys [source-ns-form target target-ns form-sources]}]
+  [{:keys [source-ns-form target target-ns form-sources form-names]}]
   (let [source-specs (header/libspec-entries source-ns-form)
         target-specs (header/libspec-entries (ns-form-source target))]
     (cond
@@ -306,18 +345,28 @@
 
           :else
           (let [rewrites (apply merge {target-ns nil} (keep :rewrites decisions))
-                results (mapv #(rewrite-qualifiers % rewrites) form-sources)
+                results (mapv #(rewrite-qualifiers % rewrites target-ns) form-sources)
+                captures (vec (mapcat (fn [result form-name]
+                                        (map #(cond-> % form-name (assoc :form form-name))
+                                             (:captures result)))
+                                      results (concat form-names (repeat nil))))
                 additions (keep :add decisions)
                 target' (reduce (fn [text {:keys [namespace alias refers]}]
                                   (require-ops/insert-into-require-sorted
                                     text (symbol namespace) alias refers))
                                 target
                                 additions)]
-            {:ok true
-             :target target'
-             :form-sources (mapv :source results)
-             :requires-added (mapv :namespace additions)
-             :qualifiers-rewritten (vec (distinct (mapcat :rewritten results)))}))))))
+            (if (seq captures)
+              {:ok false
+               :error-type :meaning-change
+               :error "A call into the target would become a plain name that a local captures"
+               :captures captures
+               :next-step "Rename the local in the moved form, then move again"}
+              {:ok true
+               :target target'
+               :form-sources (mapv :source results)
+               :requires-added (mapv :namespace additions)
+               :qualifiers-rewritten (vec (distinct (mapcat :rewritten results)))})))))))
 
 ;; ============================================================
 ;; What a symbol means in a namespace
@@ -339,6 +388,20 @@
     {:exclude (set (map str (:exclude options)))
      :only (some->> (:only options) (map str) set)}))
 
+(defn- core-shadows
+  "The moved names that `target` resolves to clojure.core: {name
+  \"clojure.core/name\"}. Defining one in the target would replace that
+  mapping for the target's own code."
+  [target moved-names]
+  (let [{:keys [exclude only]} (core-filter target)]
+    (into (sorted-map)
+          (for [name moved-names
+                :when (and (contains? core-names name)
+                           (not (contains? special-forms name))
+                           (not (contains? exclude name))
+                           (or (nil? only) (contains? only name)))]
+            [name (str "clojure.core/" name)]))))
+
 (defn- namespace-context
   "What unqualified symbols resolve to in a namespace: its definitions, its
   referred symbols, and its view of clojure.core."
@@ -347,7 +410,7 @@
     {:ns-name (some-> (ns-zloc text) z/down z/right z/string)
      :definitions (into (set extra-definitions)
                         (comp (filter #(defining? project-aliases %))
-                              (map :name))
+                              (mapcat #(cons (:name %) (:vars %))))
                         (top-level-forms text))
      :refers (into {}
                    (for [{:keys [namespace referred]} (:entries specs)
@@ -527,12 +590,27 @@
         source-deps (into {} (map (juxt :name :depends-on))
                           (analyze/intra-ns-deps source-zloc))
         target-definitions (into #{} (comp (filter #(defining? project-aliases %))
-                                           (map :name))
-                                 (top-level-forms target))]
+                                           (mapcat #(cons (:name %) (:vars %))))
+                                 (top-level-forms target))
+        ;; Vars a source form defines besides its name: protocol methods,
+        ;; record and type constructors.
+        source-forms (top-level-forms source)
+        owner-of (into {} (for [{form-name :name vars :vars} source-forms
+                                v vars]
+                            [v form-name]))
+        moved-extra (set (for [{form-name :name vars :vars} source-forms
+                               :when (contains? moved form-name)
+                               v vars]
+                           v))
+        moved-vars (into moved moved-extra)
+        moved-classes (set (for [{form-name :name type :type} source-forms
+                                 :when (and (contains? moved form-name)
+                                            (forms/defines-class? type))]
+                             form-name))]
     (cond
-      (not (:ok anchor-check)) (merge anchor-check {:source-unchanged true
+      (not (:ok anchor-check)) (merge anchor-check {:files-unchanged true :source-unchanged true
                                                     :target-unchanged true})
-      (:error plan) (assoc plan :source-unchanged true :target-unchanged true)
+      (:error plan) (assoc plan :source-unchanged true :target-unchanged true :files-unchanged true)
 
       (seq (:missing-required-public-forms plan))
       (refusal :required-public-forms-missing
@@ -540,28 +618,38 @@
                :required-public-forms (:required-public-forms plan)
                :missing-public-forms (:missing-required-public-forms plan))
 
-      (seq (set/intersection moved target-definitions))
+      (seq (set/intersection moved-vars target-definitions))
       (refusal :name-clash "The target already defines a moved name"
-               :names (vec (sort (set/intersection moved target-definitions))))
+               :names (vec (sort (set/intersection moved-vars target-definitions))))
+
+      (seq (core-shadows target moved-vars))
+      (refusal :name-clash "A moved name would shadow a clojure.core Var the target refers"
+               :core-names (core-shadows target moved-vars)
+               :next-step (str "Exclude the names with :refer-clojure in the target after checking "
+                               "its own uses of them, then move again"))
 
       :else
-      (let [left-behind (->> (sort-by :line (:_form-texts plan))
-                             (keep (fn [{form-name :name}]
-                                     (let [calls (->> (get source-deps form-name)
-                                                      (remove moved)
-                                                      sort vec)]
+      (let [staying-extra (set (remove moved-extra (keys owner-of)))
+            left-behind (->> (sort-by :line (:_form-texts plan))
+                             (keep (fn [{form-name :name text :text}]
+                                     (let [calls (->> (concat (get source-deps form-name)
+                                                              (filter staying-extra
+                                                                      (header/form-free-symbols [text])))
+                                                      (remove moved-vars)
+                                                      distinct sort vec)]
                                        (when (seq calls) {:form form-name :calls calls}))))
                              vec)
             rewrite (fn [path text mode]
                       (move-callers/rewrite-caller
-                        {:file path :text text :mode mode :moved moved
+                        {:file path :text text :mode mode :moved moved-vars
+                         :moved-classes moved-classes
                          :source-ns source-ns :target-ns target-ns :target-file target-file}))
             ;; Every caller spells the source namespace: in a libspec, an
             ;; alias declaration or a qualified name. A prefix-list libspec
             ;; spells only its last segment.
             last-segment (last (str/split source-ns #"\."))
             candidate? (fn [text]
-                         (and (some #(str/includes? text %) moved)
+                         (and (some #(str/includes? text %) (into moved-vars moved-classes))
                               (or (str/includes? text source-ns)
                                   (str/includes? text last-segment))))
             rewrite-callers (fn []
@@ -583,7 +671,7 @@
                    :suggested-forms (->> (:_form-texts plan)
                                          (mapcat #(map :name (:forms (analyze/extraction-closure
                                                                        source-zloc (:name %)))))
-                                         (concat moved (mapcat :calls left-behind))
+                                         (concat moved (map #(owner-of % %) (mapcat :calls left-behind)))
                                          distinct sort vec)
                    :next-step "Move the suggested forms together, or keep the moved form in the source")
 
@@ -603,14 +691,15 @@
                 merged (merge-requires {:source-ns-form (ns-form-source source)
                                         :target (:text target-self)
                                         :target-ns target-ns
-                                        :form-sources texts})]
+                                        :form-sources texts
+                                        :form-names (mapv :name ordered)})]
             (if-not (:ok merged)
-              (assoc merged :source-unchanged true :target-unchanged true)
+              (assoc merged :source-unchanged true :target-unchanged true :files-unchanged true)
               (let [source-context (namespace-context source project-aliases [])
-                    target-context (namespace-context (:target merged) project-aliases moved)
+                    target-context (namespace-context (:target merged) project-aliases moved-vars)
                     changes (->> (header/form-free-symbols texts)
                                  (remove #(str/includes? % "/"))
-                                 (remove moved)
+                                 (remove moved-vars)
                                  sort
                                  (keep (fn [sym]
                                          (let [before (resolve-symbol source-context sym)
@@ -642,8 +731,14 @@
                         cleaned (drop-unused-requires
                                   (extract/source-without-forms source ordered)
                                   texts)
+                        remaining-body (str/replace-first (:source cleaned)
+                                                          (or (ns-form-source (:source cleaned)) "") "")
+                        source-referred (->> (header/form-free-symbols [remaining-body])
+                                             (filter moved-extra)
+                                             (concat (:_source-referred-forms plan))
+                                             distinct sort vec)
                         source' (-> (require-target-from-source
-                                      (:source cleaned) target-ns (:_source-referred-forms plan))
+                                      (:source cleaned) target-ns source-referred)
                                     str/trimr
                                     (str "\n"))
                         graph (into {}
@@ -676,7 +771,7 @@
                                             :form form-name
                                             :uses uses})))]
                     (cond
-                      (not (:ok placed)) (assoc placed :source-unchanged true :target-unchanged true)
+                      (not (:ok placed)) (assoc placed :source-unchanged true :target-unchanged true :files-unchanged true)
 
                       cycle
                       (refusal :circular-require
@@ -696,7 +791,7 @@
                          :requires-added (:requires-added merged)
                          :requires-removed (:removed cleaned)
                          :qualifiers-rewritten (:qualifiers-rewritten merged)
-                         :source-referred-forms (:_source-referred-forms plan)
+                         :source-referred-forms source-referred
                          :warnings warnings
                          :callers (into {} (map (juxt :file :text)) callers)
                          :callers-rewritten (mapv (fn [{:keys [file rewritten requires-added requires-removed]}]

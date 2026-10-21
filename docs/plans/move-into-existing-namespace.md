@@ -118,11 +118,55 @@ Running example:
   `verify` profile runs when requested, and the formatter formats the moved
   block only.
 
-Open (asked 2026-10-21): the other caller shapes (7): `:refer :all`, `:use`,
-`:rename`, reader conditionals and `require` calls outside the `ns` form.
-They refuse with `:caller-not-rewritable` until answered. Also open: whether
-an alias-qualified quoted symbol is rewritten with a warning (built so) or
-left unchanged with a warning.
+### Other caller shapes (answered 2026-10-21, decision page "Move Into: Caller Shapes")
+
+- **`:refer :all` and `:use`.** A caller that spells the moved name gains
+  `[billing.customer :refer [has-email?]]`; the `:refer :all` or `:use`
+  stays. A file that never spells the name is not a caller.
+- **`:rename`.** The moved name's `:refer` and `:rename` entry move to the
+  target libspec; call sites keep the new name. In the target itself a
+  renamed use refuses, since rewriting it to the defined name would need
+  scope analysis.
+- **Reader conditionals.** A reference inside `#?(...)` is rewritten when the
+  target serves every platform of the caller (a `.cljc` target, or the
+  caller's own extension); otherwise the move refuses with
+  `:target-platform`. A source libspec inside a reader conditional refuses,
+  because its alias cannot be read.
+- **`require` outside the `ns` form.** Inside a `(comment ...)` form it is
+  left unchanged and listed under `:warnings` as
+  `:runtime-require-in-comment`; elsewhere it refuses.
+- **Alias-qualified quoted symbols** are rewritten like code, with a warning
+  (`*ns*` is the file's namespace only while the file loads).
+- **MCP file cap.** The MCP route reads at most 1,000 candidate files and
+  refuses above that, naming the count and the `source_roots` override.
+
+### Eval-side acceptance cases (2026-10-21)
+
+A contract kit's tool-agnostic refactoring cases, relayed by another agent,
+found these gaps; each now has a regression test.
+
+- **Unresolved references block at any level.** clj-kondo reports a
+  dangling `ns/missing` as a warning. The rollback blocks on every new error
+  and on every new `:unresolved-var`, `:unresolved-namespace` or
+  `:unresolved-symbol` finding.
+- **Capture through locals.** A call that becomes a plain name (the moved
+  forms' calls into the target, the target's calls into the moved forms)
+  is checked against the locals in scope, including `:keys`, `:strs`,
+  `:syms` and namespaced-key destructuring. A local that would capture it
+  refuses: `:meaning-change` with `:captures` in the moved forms,
+  `:local-capture` in the target. A binding form the lexical analysis does
+  not model (a record field) counts as capture when it spells the name.
+  Quoted calls into the target become fully qualified, not plain.
+- **Protocol methods and constructors.** A moved `defprotocol` moves its
+  method Vars; a moved `defrecord` or `deftype` moves `->Name` (and
+  `map->Name`). Callers, the source's refers, name clashes, left-behind
+  checks and the meaning check all count them. An import of a moved record
+  or type class refuses (`:class-import`, `:class-reference`).
+- **Shadowing clojure.core.** A moved name the target resolves to
+  `clojure.core` refuses with `:name-clash` and `:core-names`; excluding it
+  would change the target's own uses.
+- **One call reported twice.** The splice replaces a duplicate once and
+  refuses overlapping ranges.
 
 ## Public Contract
 
@@ -154,14 +198,14 @@ definition; moved unqualified `::` keywords), `:lint`, and the receipt path. Eve
 | `:ambiguous-anchor` | the anchor's name matches several forms; lists each with a typed anchor that names it exactly |
 | `:required-public-forms-missing` | an explicit `:public-forms` omits a required form |
 | `:alias-conflict` | target uses a moved form's alias for a different library |
-| `:name-clash` | target already defines a moved name |
-| `:meaning-change` | a plain symbol in a moved form resolves differently in the target |
+| `:name-clash` | target already defines a moved name, a protocol method or constructor among them (`:names`), or a moved name would shadow a `clojure.core` Var the target refers (`:core-names`) |
+| `:meaning-change` | a plain symbol in a moved form resolves differently in the target (`:changes`), or a call into the target would become a plain name a local captures (`:captures`) |
 | `:left-behind-dependencies` | a moved form calls a form that stays in the source |
-| `:caller-not-rewritable` | a reference cannot be rewritten exactly; `:references` names file, line, text and reason: `:refer-all` (`:refer :all` or `:use` with the name spelled), `:rename`, `:reader-conditional`, `:prefix-list` (the alias is unreadable), `:runtime-require` (`require`/`alias` outside the `ns` form), `:target-platform` (the caller's platform cannot load the target), `:no-ns-form`, `:unparsable` |
+| `:caller-not-rewritable` | a reference cannot be rewritten exactly; `:references` names file, line, text and reason: `:rename` (a renamed use in the target itself), `:reader-conditional` or `:prefix-list` (the source libspec's alias is unreadable), `:runtime-require` (`require`/`alias` outside the `ns` form and outside a `comment` form), `:target-platform` (the caller's platform cannot load the target), `:local-capture` (the target's call would become a plain name a local captures), `:class-import` and `:class-reference` (a moved record or type class), `:no-ns-form`, `:unparsable` |
 | `:invalid-source-roots` | a `--source-roots` entry is absolute or leaves the workspace |
 | `:circular-require` | a rewrite would make two namespaces require each other, directly or through others |
 | `:stale-source` | any planned file's hash changed before application; `:changed` names them |
-| `:lint-regression` | new clj-kondo errors after the write; everything rolled back |
+| `:lint-regression` | new clj-kondo errors, or new unresolved references at any level, after the write; everything rolled back |
 
 ## Safety Invariants
 
@@ -187,7 +231,7 @@ definition; moved unqualified `::` keywords), `:lint`, and the receipt path. Eve
 | Meaning | name defined in target; plain symbol shadowed by a target `:refer`; symbol excluded from `clojure.core` and redefined in target (the `billing.customer` / `name` case); unqualified `::k` moved unchanged with a warning; `::alias/k` rewritten like a symbol |
 | Left behind | moved form calls a remaining form (refuse with the `:ls-extract` set) |
 | Publicizing | required private form made public; explicit list missing one refuses |
-| Callers | aliased (new alias at its sorted position, the caller's own alias, alias added to an alias-less libspec, numbered on collision); qualified and var quote (spelling kept, bare require added); `:refer` entry moved, emptied `:refer` and unused libspec removed; quoted qualified symbol rewritten; quoted alias symbol rewritten with a warning; syntax quote; comment forms; strings untouched; locals with the moved name untouched; the target's own calls become plain names and its source require goes; `:refer :all`, `:use`, `:rename`, reader conditional, prefix list, runtime require, `.cljs` caller of a `.clj` target, no `ns` form and unparsable file refuse; rewrite that creates a cycle refuses; stale caller refuses; `--source-roots` override and its confinement |
+| Callers | aliased (new alias at its sorted position, the caller's own alias, alias added to an alias-less libspec, numbered on collision); qualified and var quote (spelling kept, bare require added); `:refer` entry moved, emptied `:refer` and unused libspec removed; quoted qualified symbol rewritten; quoted alias symbol rewritten with a warning; syntax quote; comment forms; strings untouched; locals with the moved name untouched; the target's own calls become plain names and its source require goes; `:refer :all` and `:use` gain a target refer; `:rename` moves to the target libspec, or refuses in the target; reader conditional rewritten for a `.cljc` target and refused for a `.clj` one; runtime require in a comment form warns; source libspec in a prefix list or reader conditional, runtime require elsewhere, `.cljs` caller of a `.clj` target, no `ns` form and unparsable file refuse; rewrite that creates a cycle refuses; stale caller refuses; `--source-roots` override and its confinement |
 | Atomicity | stale hash refuses; mid-commit failure restores all files; lint regression restores all files; receipt undo restores all files |
 
 Pure tests use literal sources. The field regression is the trial's
@@ -215,6 +259,13 @@ diff contained only the moved form, 13 rewritten call sites and their
 libspecs; the five rewritten source namespaces then loaded in a cold JVM and
 the moved function ran. `undo-extract!` restored all 10 files. clj-kondo was
 not installed, so the lint rollback ran only with a stub.
+
+After reader-conditional references became rewritable, the
+`lower-case-en` and `upper-case-en` plans pass every caller check (1.1-1.8
+s) and stop at a stage 2 limit instead: `app.util`'s `:require` holds a
+`#?@(:clj ...)` splice, which the header merge refuses with
+`:unsupported-require-minimization`. Moving forms out of a `.cljc` source
+whose requires use reader conditionals is open.
 
 ## Stages
 

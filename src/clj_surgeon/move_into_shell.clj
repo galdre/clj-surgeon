@@ -37,10 +37,21 @@
         {:checked true :findings (vec (:findings parsed))}
         {:checked false :reason "clj-kondo output could not be read"}))))
 
-(defn- new-errors
-  "Error findings in `after` that `before` does not have, ignoring position."
+(def ^:private blocking-types
+  "Findings that block at any level: clj-kondo reports a reference to a Var
+  or namespace that does not exist as a warning, and a move must never leave
+  one behind."
+  #{:unresolved-var :unresolved-namespace :unresolved-symbol})
+
+(defn- blocking? [{:keys [level type]}]
+  (or (= :error (keyword level))
+      (contains? blocking-types (keyword type))))
+
+(defn new-blocking-findings
+  "Blocking findings in `after` that `before` does not have, ignoring
+  position: every error, and every unresolved reference at any level."
   [before after]
-  (let [errors #(filter (fn [finding] (= :error (keyword (:level finding)))) %)
+  (let [errors #(filter blocking? %)
         baseline (frequencies (map diagnostic-delta/finding-identity (errors before)))]
     (:selected
       (reduce (fn [{:keys [remaining] :as state} finding]
@@ -236,11 +247,11 @@
                               {:error-type :move-read-back-failed})))
             (let [after (if (:checked baseline) (lint files) baseline)
                   introduced (when (and (:checked baseline) (:checked after))
-                               (new-errors (:findings baseline) (:findings after)))]
+                               (new-blocking-findings (:findings baseline) (:findings after)))]
               (if (seq introduced)
                 {:ok false
                  :error-type :lint-regression
-                 :error "The move introduced clj-kondo errors; every file was restored"
+                 :error "The move introduced clj-kondo errors or unresolved references; every file was restored"
                  :new-errors (vec (take 10 introduced))
                  :restored (restore! entries)}
                 (cond-> (assoc (summary result)

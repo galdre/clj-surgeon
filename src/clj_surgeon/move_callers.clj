@@ -9,6 +9,7 @@
   removed. In :target mode the file is the target itself, so references
   become plain names and no require is added."
   (:require
+   [clj-surgeon.analyze :as analyze]
    [clj-surgeon.cljc.require-ops :as require-ops]
    [clj-surgeon.extract-header :as header]
    [clojure.string :as str]
@@ -129,6 +130,22 @@
       (z/list? entry) {:shape :prefix-list}
       :else {:shape :reader-conditional})))
 
+(defn- class-imports
+  "Entries of the ns form's :import clause that import one of `classes` from
+  `source-ns`'s package: [{:line (within the ns form) :class}]."
+  [ns-loc source-ns classes]
+  (let [package (str/replace source-ns "-" "_")]
+    (for [entry (clause-children (ns-clause ns-loc ":import"))
+          :let [node (z/node entry)
+                row (:row (meta node))
+                tokens (keep #(when (= :token (n/tag %)) (n/string %))
+                             (tree-seq n/inner? n/children node))]
+          class (sort classes)
+          :when (if (#{:vector :list} (n/tag node))
+                  (and (= package (first tokens)) (some #{class} (rest tokens)))
+                  (= (str package "." class) (n/string node)))]
+      {:line row :class class})))
+
 (defn- file-aliases
   "alias -> namespace for every libspec vector of a file."
   [ns-loc]
@@ -181,6 +198,41 @@
           (z/replace vector-loc (symbols-vector-node
                                   (distinct (concat (map str (z/sexpr vector-loc)) refers))))
           (append-option libspec :refer (symbols-vector-node refers)))))))
+
+(defn- map-node-of
+  "A map node {k v ...} of string keys and values, in the given order."
+  [entries]
+  (n/map-node (vec (interpose (n/spaces 1)
+                              (mapcat (fn [[k v]] [(n/token-node (symbol k)) (n/token-node (symbol v))])
+                                      entries)))))
+
+(defn- add-renames
+  "Add `renames` {original new-name} to `lib`'s :rename map in `text`."
+  [text lib renames]
+  (if (empty? renames)
+    text
+    (edit-libspec
+      text lib
+      (fn [libspec]
+        (if-let [map-loc (some-> (option-loc libspec ":rename") z/right)]
+          (z/replace map-loc (map-node-of (concat (map (fn [[k v]] [(str k) (str v)]) (z/sexpr map-loc))
+                                                  (sort renames))))
+          (append-option libspec :rename (map-node-of (sort renames))))))))
+
+(defn- remove-renames
+  "Remove `names` from `lib`'s :rename map, and the :rename option when it
+  empties."
+  [text lib names]
+  (let [doomed (set names)]
+    (edit-libspec
+      text lib
+      (fn [libspec]
+        (let [map-loc (some-> (option-loc libspec ":rename") z/right)
+              kept (remove (comp doomed str key) (z/sexpr map-loc))]
+          (if (seq kept)
+            (z/replace map-loc (map-node-of (map (fn [[k v]] [(str k) (str v)]) kept)))
+            ;; z/remove moves to the previous value, the :rename keyword.
+            (-> map-loc z/remove z/remove)))))))
 
 (defn- add-alias [text lib alias]
   (edit-libspec text lib #(append-option % :as (n/token-node (symbol alias)))))
@@ -250,7 +302,7 @@
 
 (defn- child-context
   "The context a node gives its children: the nearest enclosing quote, and
-  whether they sit inside a reader conditional or a runtime require call."
+  whether they sit inside a comment form or a runtime require call."
   [context node]
   (let [tag (n/tag node)
         head (list-head node)]
@@ -258,10 +310,8 @@
       (= :quote tag) (assoc :quote :quote)
       (= :syntax-quote tag) (assoc :quote :syntax-quote)
       (= "quote" head) (assoc :quote :quote)
-      (contains? #{"require" "use" "alias" "load"} head) (assoc :runtime-require true)
-      (and (= :reader-macro tag)
-           (some-> (first (n/children node)) n/string (str/starts-with? "?")))
-      (assoc :reader-conditional true))))
+      (= "comment" head) (assoc :comment true)
+      (contains? #{"require" "use" "alias" "load"} head) (assoc :runtime-require true))))
 
 (defn- reduce-tokens
   "Reduce f over every token node of the top-level `forms` other than
@@ -301,7 +351,10 @@
       {:kind :aliased :local local}
       prefix nil
       (= text source-ns) {:kind :source-ns}
+      (some #(and (contains? moved (key %)) (= text (val %))) (:renamed source))
+      {:kind :renamed :local (key (some #(when (= text (val %)) %) (:renamed source))) :as text}
       (not (contains? moved text)) nil
+      (contains? (:renamed source) text) nil
       (and (vector? (:referred source)) (some #{text} (:referred source))) {:kind :referred :local text}
       (= :all (:referred source)) {:kind :refer-all :local text}
       :else nil)))
@@ -316,40 +369,56 @@
       found
       (update found :plain conj text))))
 
+(defn- replace-token
+  "Plan the replacement of one qualified or aliased reference."
+  [found node local quote {:keys [mode target-ns target-alias source-ns]}]
+  (let [text (n/string node)
+        {:keys [row col end-col]} (meta node)
+        kind (if (str/starts-with? text (str source-ns "/")) :qualified :aliased)
+        to (cond
+             (and (= :target mode) (= :quote quote)) (str target-ns "/" local)
+             (= :target mode) local
+             (= :qualified kind) (str target-ns "/" local)
+             :else (str target-alias "/" local))]
+    (cond-> (update found :replacements conj
+                    {:line row :col col :end-col end-col :from text :to to :kind kind})
+      (and (= :quote quote) (= :aliased kind) (not= :target mode))
+      (update :warnings conj {:type :quoted-alias-symbol :line row :from text :to to}))))
+
 (defn- scan
   "Plan the replacements, in document order, and find the problems."
-  [forms ns-node {:keys [mode target-ns target-alias] :as context}]
+  [forms ns-node {:keys [mode] :as context}]
   (reduce-tokens
     forms ns-node
-    (fn [found node {:keys [quote reader-conditional runtime-require]}]
+    (fn [found node {:keys [quote comment runtime-require]}]
       (let [text (symbol-text node)
-            {:keys [kind local]} (some-> text (classify context))
-            {:keys [row col end-col]} (meta node)
+            {:keys [kind local] :as classified} (some-> text (classify context))
+            row (:row (meta node))
             problem #(update found :problems conj {:line row :reason % :text text})
             found (cond-> (if (#{:qualified :aliased} kind)
                             found
                             (record-use found (n/string node)))
+                    (and text (contains? (:class-names context) text))
+                    (update :class-references conj {:line row :text text})
                     (and text (contains? (:moved context) (or (second (split-qualified text)) text)))
                     (update :mentions conj row))]
         (cond
           (nil? kind) found
-          (= :source-ns kind) (if runtime-require (problem :runtime-require) found)
-          reader-conditional (problem :reader-conditional)
-          (= :refer-all kind) (if (= :target mode) found (problem :refer-all))
-          (= :referred kind) (update found :referred conj {:line row :text local})
-          :else
-          (let [to (cond
-                     (and (= :target mode) (= :quote quote)) (str target-ns "/" local)
-                     (= :target mode) local
-                     (= :qualified kind) (str target-ns "/" local)
-                     :else (str target-alias "/" local))]
-            (cond-> (update found :replacements conj
-                            {:line row :col col :end-col end-col :from text :to to :kind kind})
-              (and (= :quote quote) (= :aliased kind) (not= :target mode))
-              (update :warnings conj {:type :quoted-alias-symbol :line row
-                                      :from text :to to}))))))
-    {:replacements [] :problems [] :referred [] :warnings [] :prefixes #{} :plain #{}
-     :mentions []}))
+          (= :source-ns kind) (cond
+                                (not runtime-require) found
+                                ;; A comment form is never evaluated.
+                                comment (update found :warnings conj
+                                                {:type :runtime-require-in-comment :line row})
+                                :else (problem :runtime-require))
+          (= :target mode) (if (#{:qualified :aliased} kind)
+                             (replace-token found node local quote context)
+                             found)
+          (#{:referred :refer-all} kind) (update found :referred conj {:line row :text local})
+          (= :renamed kind) (update found :renamed conj {:line row :text text
+                                                         :local local :as (:as classified)})
+          :else (replace-token found node local quote context))))
+    {:replacements [] :problems [] :referred [] :renamed [] :warnings [] :prefixes #{} :plain #{}
+     :mentions [] :class-references []}))
 
 (defn- line-chunks
   "Split text into lines that keep their terminators."
@@ -357,9 +426,7 @@
   (let [chunks (vec (str/split text #"(?<=\n)" -1))]
     (if (and (seq chunks) (= "" (peek chunks))) (pop chunks) chunks)))
 
-(defn- apply-replacements
-  "Splice each planned token by its line and columns, checking that the
-  original token is exactly what the scan saw."
+(defn- apply-sorted-replacements
   [text replacements]
   (if (empty? replacements)
     text
@@ -376,6 +443,81 @@
                  (line-chunks text))
          (apply str))))
 
+(defn locals-at-probes
+  "For each probe name in `probes`, the locals in scope where it occurs in
+  `text`'s top-level forms: a set, or :unknown when the form holding it cannot
+  be read as data (a reader conditional, say). Forms with no probe are not
+  read."
+  [text probes]
+  (let [wanted (set probes)]
+    (reduce
+      (fn [result node]
+        (let [present (filterv #(str/includes? (n/string node) %) wanted)]
+          (if (empty? present)
+            result
+            (merge result
+                   (try
+                     (let [found (analyze/locals-at
+                                   (n/sexpr node {:auto-resolve (fn [alias] (symbol (str alias)))})
+                                   present)
+                           known (:known-locals found)]
+                       ;; A probe the analysis never reached sits in a form it
+                       ;; does not understand.
+                       (into {} (map (fn [p] [p (if-let [v (found p)]
+                                                  (with-meta v {:known-locals known})
+                                                  :unknown)]))
+                             present))
+                     (catch Exception _
+                       (zipmap present (repeat :unknown))))))))
+      (zipmap probes (repeat nil))
+      (remove #(gap-tags (n/tag %)) (n/children (parser/parse-string-all text))))))
+
+(defn- unknown-binder?
+  "Does `name` occur in the top-level form holding `probe` although the
+  lexical analysis never saw it bound there? A form the analysis does not
+  model, such as a record field, may bind it, and the analysis reads such a
+  binding as a free reference. Conservative: a plain use of the name in the
+  same form also counts."
+  [text probe name known-locals]
+  (and (not (contains? known-locals name))
+       (some (fn [node]
+               (when (str/includes? (n/string node) probe)
+                 (some #(and (= :token (n/tag %)) (= name (n/string %)))
+                       (tree-seq n/inner? n/children node))))
+             (n/children (parser/parse-string-all text)))))
+
+(defn capture-check
+  "Plan plain names for some positions: `probe-text` holds a probe symbol at
+  each, and `probe->name` names the plain name each would become. Returns the
+  probes whose name is, or may be, a local there."
+  [probe-text probe->name]
+  (let [locals (locals-at-probes probe-text (keys probe->name))]
+    (set (filter (fn [probe]
+                   (let [name (probe->name probe)
+                         in-scope (locals probe)]
+                     (or (= :unknown in-scope)
+                         (contains? in-scope name)
+                         (unknown-binder? probe-text probe name
+                                          (:known-locals (meta in-scope))))))
+                 (keys probe->name)))))
+
+(defn probe-name
+  "A symbol name no source contains, for the i-th position under test."
+  [i]
+  (str "__clj_surgeon_capture_probe_" i "__"))
+
+(defn- apply-replacements
+  "Splice each planned token by its line and columns, checking that the
+  original token is exactly what the scan saw. A token planned twice is
+  replaced once; overlapping ranges refuse rather than splice twice."
+  [text replacements]
+  (let [replacements (vals (into {} (map (juxt (juxt :line :col :end-col :from :to) identity))
+                                 replacements))]
+    (doseq [[a b] (->> replacements (sort-by (juxt :line :col)) (partition 2 1))
+            :when (and (= (:line a) (:line b)) (< (:col b) (:end-col a)))]
+      (throw (ex-info "Planned replacements overlap" {:line (:line a) :tokens [(:from a) (:from b)]})))
+    (apply-sorted-replacements text replacements)))
+
 ;; ============================================================
 ;; One file
 ;; ============================================================
@@ -389,10 +531,10 @@
          (not (contains? prefixes source-ns))
          (not (and alias (contains? prefixes alias)))
          (not-any? plain kept-refers)
-         (not-any? plain (vals renamed)))))
+         (not-any? plain (vals (remove (comp moved key) renamed))))))
 
 (defn- rewrite-parsed
-  [{:keys [file text source-ns target-ns target-file moved mode]} forms]
+  [{:keys [file text source-ns target-ns target-file moved moved-classes mode]} forms]
   ;; Parse once. Every ns-form read and edit works on the ns form's own text,
   ;; which is then spliced back between the text before it and the body.
   (let [moved (set (map str moved))
@@ -408,15 +550,16 @@
                        (or (:alias target)
                            (header/allocate-alias target-ns (or (some-> ns-loc file-aliases) {}))))
         context {:mode mode :source-ns source-ns :target-ns target-ns
-                 :target-alias target-alias :moved moved :source source}
-        {:keys [replacements problems referred warnings mentions] :as uses}
+                 :target-alias target-alias :moved moved :source source
+                 :class-names (set (map #(str (str/replace source-ns "-" "_") "." %) moved-classes))}
+        {:keys [replacements problems referred renamed warnings mentions] :as uses}
         (scan forms ns-node context)
         renamed-moved (filter moved (keys (:renamed source)))
         moved-refers (when (vector? (:referred source)) (filterv moved (:referred source)))
-        needs-target? (or (seq replacements) (seq referred))
+        needs-target? (or (seq replacements) (seq referred) (seq renamed))
         ns-line (some-> ns-node meta :row)
         problems (cond-> problems
-                   (seq renamed-moved)
+                   (and (= :target mode) (seq renamed-moved))
                    (conj {:line ns-line :reason :rename :text (str/join " " renamed-moved)})
 
                    ;; The alias is unreadable, so any spelling of a moved name may
@@ -434,7 +577,26 @@
                         (not (target-serves? target-file file)))
                    (into (map (fn [{:keys [line from text]}]
                                 {:line line :reason :target-platform :text (or from text)})
-                              (concat replacements referred))))
+                              (concat replacements referred renamed))))
+        ;; In the target, a reference becomes a plain name; a local of that
+        ;; name in scope would capture it.
+        plain (vec (keep-indexed (fn [i r] (when (and (= :target mode) (= (:to r) (second (split-qualified (:from r)))))
+                                             (assoc r :probe (probe-name i))))
+                                 replacements))
+        captured (when (seq plain)
+                   (capture-check (apply-replacements text (map #(assoc % :to (:probe %)) plain))
+                                  (into {} (map (juxt :probe :to)) plain)))
+        problems (into problems
+                       (for [r plain :when (contains? captured (:probe r))]
+                         {:line (:line r) :reason :local-capture :text (:from r)}))
+        ;; A moved record or type is a class in the source's package; an
+        ;; import of it, or a class-qualified use, would dangle.
+        problems (into problems
+                       (concat
+                         (for [{:keys [line class]} (some-> ns-loc (class-imports source-ns moved-classes))]
+                           {:line (+ ns-line (dec line)) :reason :class-import :text class})
+                         (for [{:keys [line text]} (:class-references uses)]
+                           {:line line :reason :class-reference :text text})))
         problems (mapv #(assoc % :file file) problems)]
     (if (seq problems)
       {:ok false :problems problems}
@@ -442,14 +604,16 @@
                        (+ (count prefix) (count ns-text)))
             text' ns-text
             need-alias? (some #(= :aliased (:kind %)) replacements)
-            used-refers (vec (sort (distinct (map :text referred))))
+            used-refers (vec (sort (distinct (concat (map :text referred) (map :local renamed)))))
+            used-renames (into {} (map (juxt :local :as)) renamed)
             [text' added]
             (cond
               (or (= :target mode) (not needs-target?)) [text' []]
 
               (nil? target)
-              [(require-ops/insert-into-require-sorted
-                 text' (symbol target-ns) (when need-alias? target-alias) (not-empty used-refers))
+              [(-> (require-ops/insert-into-require-sorted
+                     text' (symbol target-ns) (when need-alias? target-alias) (not-empty used-refers))
+                   (add-renames target-ns used-renames))
                [target-ns]]
 
               :else
@@ -457,13 +621,19 @@
                     text' (if (and need-alias? (nil? (:alias target)))
                             (add-alias text' target-ns target-alias)
                             text')]
-                [(add-refers text' target-ns used-refers) []]))
+                [(-> text'
+                     (add-refers target-ns used-refers)
+                     (add-renames target-ns used-renames))
+                 []]))
             remove-source? (and (= :vector (:shape source))
-                                (or (seq replacements) (seq moved-refers))
+                                (or (seq replacements) (seq moved-refers) (seq renamed-moved))
                                 (unused? source-ns source moved uses))
             text' (cond
                     remove-source? (remove-libspecs text' [source-ns])
-                    (seq moved-refers) (remove-refers text' source-ns moved-refers)
+                    (or (seq moved-refers) (seq renamed-moved))
+                    (cond-> text'
+                      (seq renamed-moved) (remove-renames source-ns renamed-moved)
+                      (seq moved-refers) (remove-refers source-ns moved-refers))
                     :else text')
             text' (str prefix text' body)]
         {:ok true
