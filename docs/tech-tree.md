@@ -31,6 +31,7 @@ competitor) · **BUILDING** (in flight, branch named) · **OPEN** (filed, not st
 | `within` + `from`/`to` surgical edit | WON | MCP | l1 A-0, A-4, Y-0, zero churn |
 | `expect_matched` basis → `unaddressed_matches` in the transaction receipt | BUILT | MCP | friction ledger item 2 (19 matched, 16 addressed); inb-a97614 |
 | `:extract!` to a new namespace | WON | CLI + MCP extraction verb | no native equivalent; safe-refactor skill |
+| `:extract! --into-existing` (move forms into an existing namespace, callers rewritten, plan-first) | OPEN | CLI, then MCP | docs/plans/move-into-existing-namespace.md; invoice refactoring trial 2026-10-21 (agent stopped: no tool could move into an existing namespace) |
 | `:mv` + `:fix-declares!`, `:rename-ns!` | WON | CLI | no native equivalent |
 | owner-kind-namespace insertion (whole-file churn) | LOST; mechanism corrected: Surgeon runs standard-clojure-style whole-file on changes/basis/extraction routes, never on edits | MCP | clj-surgeon-46o re-scoped to formatter scope; big-aha log |
 | per-form writes for a fan-out change | LOST | MCP | l1: 8 to 10 writes on top of a native patch (fbcaed1) |
