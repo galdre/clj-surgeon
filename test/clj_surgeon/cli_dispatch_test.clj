@@ -321,3 +321,62 @@
                (str/index-of moved "(defn run-kondo")))
         (is (str/blank? err)))
       (finally (.delete tmp)))))
+
+;; ============================================================
+;; Subprocess CLI — moving forms into an existing namespace
+;; (docs/plans/move-into-existing-namespace.md), in the GNU style the plan
+;; documents
+;; ============================================================
+
+(defn- invoice-project! []
+  (let [root (doto (java.io.File/createTempFile "clj-surgeon-cli-move-into" "") .delete .mkdirs)]
+    (spit (io/file root "deps.edn") "{:paths [\"src\"] :aliases {:test {:extra-paths [\"test\"]}}}\n")
+    (doseq [[path text]
+            {"src/billing/customer.clj"
+             "(ns billing.customer)\n\n(defn email [c] (:email c))\n"
+             "src/billing/invoice.clj"
+             (str "(ns billing.invoice\n  (:require\n   [billing.customer :as customer]))\n\n"
+                  "(defn- has-email? [c] (some? (customer/email c)))\n\n"
+                  "(defn deliver! [c] (when (has-email? c) :queued))\n")
+             "test/billing/invoice_test.clj"
+             (str "(ns billing.invoice-test\n  (:require\n   [billing.invoice]\n   [clojure.test :refer [deftest is]]))\n\n"
+                  "(deftest has-email (is (#'billing.invoice/has-email? {:email \"a@b\"})))\n")}]
+      (let [f (io/file root path)]
+        (.mkdirs (.getParentFile f))
+        (spit f text)))
+    root))
+
+(defn- delete-tree! [f]
+  (when (.isDirectory f) (run! delete-tree! (.listFiles f)))
+  (.delete f))
+
+(deftest cli-move-into-existing-plans-applies-and-refuses-with-edn
+  (let [root (invoice-project!)
+        path #(str (io/file root %))
+        move-args ["--file" (path "src/billing/invoice.clj") "--forms" "[has-email?]"
+                   "--to" (path "src/billing/customer.clj") "--into-existing"]]
+    (try
+      (testing "help documents the flags"
+        (let [{:keys [out]} (run-cli "extract!" "--help")]
+          (is (str/includes? out "into-existing"))
+          (is (str/includes? out "source-roots"))))
+      (testing "a refusal is EDN with a nonzero exit and leaves every file unchanged"
+        (let [before (slurp (path "test/billing/invoice_test.clj"))
+              {:keys [exit out]} (apply run-cli "extract!" (concat move-args ["--below" "nope"]))]
+          (is (pos? exit))
+          (is (= :anchor-not-found (:error-type (edn/read-string out))))
+          (is (= before (slurp (path "test/billing/invoice_test.clj"))))))
+      (testing "the plan names the caller it will rewrite"
+        (let [{:keys [exit out]} (apply run-cli "extract" (concat move-args ["--below" "email"]))
+              result (edn/read-string out)]
+          (is (zero? exit))
+          (is (= ["test/billing/invoice_test.clj"] (:callers-to-review result)))))
+      (testing "the apply rewrites the caller"
+        (let [{:keys [exit out err]} (apply run-cli "extract!" (concat move-args ["--below" "email"]))
+              result (edn/read-string out)]
+          (is (zero? exit) err)
+          (is (:applied result))
+          (is (= 3 (:files-written result)))
+          (is (str/includes? (slurp (path "test/billing/invoice_test.clj"))
+                             "#'billing.customer/has-email?"))))
+      (finally (delete-tree! root)))))

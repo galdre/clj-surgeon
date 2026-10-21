@@ -133,3 +133,91 @@
         (is (= :receipt-result-changed (:error-type undo)))
         (is (= "(ns billing.customer)\n" (slurp customer))))
       (finally (delete-recursive! root)))))
+
+;; Field shape (invoice trial follow-up): the test file reaches the private
+;; helper through a fully qualified var quote, so the move must rewrite it.
+(defn- invoice-project-with-test! []
+  (let [root (invoice-project!)
+        dir (doto (io/file root "test" "billing") .mkdirs)]
+    (spit (io/file root "deps.edn") "{:paths [\"src\"] :aliases {:test {:extra-paths [\"test\"]}}}\n")
+    (spit (io/file dir "invoice_test.clj")
+          (str "(ns billing.invoice-test\n"
+               "  (:require\n"
+               "   [billing.invoice]\n"
+               "   [clojure.test :refer [deftest is]]))\n\n"
+               "(deftest has-email\n"
+               "  (is (#'billing.invoice/has-email? {:email \"a@b\"})))\n"))
+    (doto (io/file root "target" "classes" "billing") .mkdirs)
+    (spit (io/file root "target" "classes" "billing" "stale_copy.clj")
+          "(ns billing.stale-copy\n  (:require [billing.invoice :as inv]))\n\n(defn f [c] (inv/has-email? c))\n")
+    root))
+
+(deftest callers-in-other-files-are-rewritten-and-linted-together
+  (let [root (invoice-project-with-test!)
+        test-file (io/file root "test" "billing" "invoice_test.clj")
+        build-copy (io/file root "target" "classes" "billing" "stale_copy.clj")
+        build-copy-before (slurp build-copy)
+        linted (atom [])
+        lint (fn [files] (swap! linted conj (set (map #(.getName (io/file (str %))) files)))
+               {:checked true :findings []})]
+    (try
+      (let [result (shell/execute! (opts root :lint lint))]
+        (is (:applied result))
+        (is (str/includes? (slurp test-file) "(#'billing.customer/has-email? {:email \"a@b\"})"))
+        (is (str/includes? (slurp test-file) "   [billing.customer]\n   [billing.invoice]\n"))
+        (testing "files are named relative to the workspace, so the result stays small"
+          (is (= [{:file "test/billing/invoice_test.clj" :rewritten 1
+                   :requires-added ["billing.customer"] :requires-removed []}]
+                 (:callers-rewritten result)))
+          (is (= ["test/billing/invoice_test.clj"] (:callers-to-review result))))
+        (testing "lint saw every file the move rewrote, before and after"
+          (is (= [#{"invoice.clj" "customer.clj" "invoice_test.clj"}
+                  #{"invoice.clj" "customer.clj" "invoice_test.clj"}]
+                 @linted)))
+        (testing "files outside the declared source roots are not callers"
+          (is (= build-copy-before (slurp build-copy)))))
+      (finally (delete-recursive! root)))))
+
+(deftest a-receipt-undoes-every-rewritten-file
+  (let [root (invoice-project-with-test!)
+        files (mapv #(io/file root %) ["src/billing/customer.clj" "src/billing/invoice.clj"
+                                       "test/billing/invoice_test.clj"])
+        receipt (io/file root "move.edn")
+        before (mapv slurp files)]
+    (try
+      (is (:applied (shell/execute! (opts root :receipt-out (str receipt)))))
+      (is (every? true? (map not= before (map slurp files))))
+      (is (:restored (shell/undo! {:receipt (str receipt)})))
+      (is (= before (mapv slurp files)))
+      (finally (delete-recursive! root)))))
+
+(deftest a-caller-changed-after-planning-refuses
+  (let [root (invoice-project-with-test!)
+        test-file (io/file root "test" "billing" "invoice_test.clj")
+        customer (io/file root "src" "billing" "customer.clj")
+        customer-before (slurp customer)]
+    (try
+      (let [planned (shell/plan (opts root))
+            _ (spit test-file (str (slurp test-file) "\n;; edited\n"))
+            result (shell/apply-plan! (opts root) planned)]
+        (is (= :stale-source (:error-type result)))
+        (is (= ["test/billing/invoice_test.clj"] (:changed result)))
+        (is (= customer-before (slurp customer))))
+      (finally (delete-recursive! root)))))
+
+(deftest source-roots-override-the-declared-roots
+  (let [root (invoice-project-with-test!)
+        build-copy (io/file root "target" "classes" "billing" "stale_copy.clj")]
+    (try
+      (testing "a listed root is scanned even though deps.edn does not declare it"
+        (let [r (shell/plan (opts root :source-roots ["src" "test" "target/classes"]))]
+          (is (:ok r))
+          (is (= ["target/classes/billing/stale_copy.clj" "test/billing/invoice_test.clj"]
+                 (:callers-to-review r)))))
+      (testing "roots outside the workspace refuse"
+        (doseq [bad [["../elsewhere"] ["/etc"]]]
+          (let [r (shell/execute! (opts root :source-roots bad))]
+            (is (= :invalid-source-roots (:error-type r)))
+            (is (:files-unchanged r)))))
+      (is (str/includes? (slurp build-copy) "inv/has-email?"))
+      (finally (delete-recursive! root)))))

@@ -32,38 +32,43 @@
                           (str/split #"\.")
                           last))))
 
-(defn- workspace-files
-  [project-root]
-  (let [root (mcp-paths/real-root project-root)
-        roots (->> (source-anchor/workspace-source-roots project-root)
-                   (map #(-> root (.resolve (str %)) .toFile))
-                   (filter #(.exists %))
-                   (map #(.getCanonicalFile %))
-                   distinct
-                   (sort-by #(-> % .toPath .getNameCount))
-                   (reduce (fn [outermost candidate]
-                             (if (some #(.startsWith (.toPath candidate)
-                                                     (.toPath %))
-                                       outermost)
-                               outermost
-                               (conj outermost candidate)))
-                           []))]
-    (->> roots
-         (mapcat
-           (fn [source-root]
-             (tree-seq
-               (fn [file]
-                 (and (.isDirectory file)
-                      (not (contains? excluded-directory-names
-                                      (.getName file)))))
-               (fn [file] (or (seq (.listFiles file)) []))
-               source-root)))
-         (filter clojure-source-file?)
-         (filter #(relative-to-root root (.getCanonicalFile %)))
-         (map #(.getCanonicalFile %))
-         distinct
-         (sort-by #(.getPath %))
-         vec)))
+(defn workspace-files
+  "Canonical Clojure files under the workspace's declared source roots, or
+  under `source-roots` (relative to the workspace) when given, confined to
+  the root, skipping build and tool directories."
+  ([project-root]
+   (workspace-files project-root (source-anchor/workspace-source-roots project-root)))
+  ([project-root source-roots]
+   (let [root (mcp-paths/real-root project-root)
+         roots (->> source-roots
+                    (map #(-> root (.resolve (str %)) .toFile))
+                    (filter #(.exists %))
+                    (map #(.getCanonicalFile %))
+                    distinct
+                    (sort-by #(-> % .toPath .getNameCount))
+                    (reduce (fn [outermost candidate]
+                              (if (some #(.startsWith (.toPath candidate)
+                                                      (.toPath %))
+                                        outermost)
+                                outermost
+                                (conj outermost candidate)))
+                            []))]
+     (->> roots
+          (mapcat
+            (fn [source-root]
+              (tree-seq
+                (fn [file]
+                  (and (.isDirectory file)
+                       (not (contains? excluded-directory-names
+                                       (.getName file)))))
+                (fn [file] (or (seq (.listFiles file)) []))
+                source-root)))
+          (filter clojure-source-file?)
+          (filter #(relative-to-root root (.getCanonicalFile %)))
+          (map #(.getCanonicalFile %))
+          distinct
+          (sort-by #(.getPath %))
+          vec))))
 
 (defn- top-level-locations
   [root]

@@ -71,10 +71,22 @@ shows the `.clj-surgeon.edn` `:aliases` entry for an unrecognized macro), an
 ambiguous anchor (use a typed one such as `'defmethod render :card'`), a name
 the target already defines, a plain symbol that would mean something else in
 the target, a moved form that calls one left behind (move the suggested set
-together), an alias conflict, or a circular require. A new clj-kondo error
-after the write restores both files. Warnings name moved unqualified `::`
-keywords and moved forms placed above a target form they call. Callers in
-other files are reported, not rewritten.
+together), an alias conflict, a reference it cannot rewrite exactly, or a
+circular require. Callers in other files are rewritten in the same move:
+`inv/has-email?` takes the caller's alias for the target (one is added when
+missing), `billing.invoice/has-email?` and `#'billing.invoice/has-email?`
+keep their fully qualified spelling, and a referred name moves to a `:refer`
+on the target libspec. Requires that a rewrite leaves unused are removed. The
+target's own calls through the source become plain names. Callers are found
+under the declared source roots; pass `--source-roots '["src" "test"]'` to
+scan other directories. `:caller-not-rewritable` names each file, line and
+reason (`:refer-all`, `:rename`, `:reader-conditional`, `:prefix-list`,
+`:runtime-require`, `:target-platform`, `:no-ns-form`, `:unparsable`).
+Every file is hash-fenced, and a new clj-kondo error in any written file
+restores them all. Warnings name moved unqualified `::` keywords, moved forms
+placed above a target form they call, and rewritten alias-qualified quoted
+symbols (`'inv/has-email?`), which resolve through whatever namespace is
+current at run time.
 
 The dry run also reports authority-labeled `quoted-var-references` for exact
 `#'name` and `(var name)` callers that semantic indexes can omit. Review all

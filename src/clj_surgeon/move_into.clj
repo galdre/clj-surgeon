@@ -11,6 +11,7 @@
    [clj-surgeon.extract :as extract]
    [clj-surgeon.extract-header :as header]
    [clj-surgeon.forms :as forms]
+   [clj-surgeon.move-callers :as move-callers :refer [ns-clause ns-zloc remove-libspecs]]
    [clojure.set :as set]
    [clojure.string :as str]
    [rewrite-clj.node :as n]
@@ -330,20 +331,6 @@
 (def ^:private core-names
   (into special-forms (map str) (keys (ns-publics 'clojure.core))))
 
-(defn- ns-zloc [text]
-  (some->> (z/of-string text)
-           (iterate z/right)
-           (take-while some?)
-           (filter #(and (z/list? %) (= "ns" (some-> % z/down z/string))))
-           first))
-
-(defn- ns-clause [ns-loc keyword-text]
-  (some->> (some-> ns-loc z/down)
-           (iterate z/right)
-           (take-while some?)
-           (filter #(and (z/list? %) (= keyword-text (some-> % z/down z/string))))
-           first))
-
 (defn- core-filter
   "The :refer-clojure :exclude / :only options of a namespace."
   [text]
@@ -384,22 +371,40 @@
 ;; ============================================================
 
 (defn- required-namespaces
-  "Namespaces named in the :require and :use clauses of a namespace, read
-  leniently: vectors, bare symbols, and prefix lists."
+  "Namespaces named in the :require and :use clauses of an ns form, read
+  leniently: vectors, bare symbols, and prefix lists. A clause that cannot be
+  read as data (a reader conditional) contributes every symbol it holds, so
+  the graph can only gain edges, never lose one."
+  [ns-loc]
+  (set
+    (for [clause (keep #(ns-clause ns-loc %) [":require" ":use"])
+          lib (try
+                (for [entry (rest (z/sexpr clause))
+                      lib (cond
+                            (symbol? entry) [entry]
+                            (vector? entry) [(first entry)]
+                            (seq? entry) (for [child (rest entry)]
+                                           (symbol (str (first entry) "."
+                                                        (if (vector? child) (first child) child))))
+                            :else [])]
+                  lib)
+                (catch Exception _
+                  (->> (tree-seq n/inner? n/children (z/node clause))
+                       (filter #(= :token (n/tag %)))
+                       (map n/string)
+                       (remove #(re-find #"^[:\"\\\d#]" %)))))]
+      (str lib))))
+
+(defn- ns-requires
+  "[namespace required-namespaces] read from the ns form a file starts with,
+  without parsing the rest of it; nil when there is none. A file that cannot
+  be read cannot be required, so it cannot close a cycle."
   [text]
-  (let [loc (ns-zloc text)
-        clauses (keep #(some-> loc (ns-clause %) z/sexpr) [":require" ":use"])]
-    (set
-      (for [clause clauses
-            entry (rest clause)
-            lib (cond
-                  (symbol? entry) [entry]
-                  (vector? entry) [(first entry)]
-                  (seq? entry) (for [child (rest entry)]
-                                 (symbol (str (first entry) "."
-                                              (if (vector? child) (first child) child))))
-                  :else [])]
-        (str lib)))))
+  (when-let [ns-text (move-callers/leading-ns-text text)]
+    (try
+      (let [loc (ns-zloc ns-text)]
+        [(some-> loc z/down z/right z/string) (required-namespaces loc)])
+      (catch Exception _ nil))))
 
 (defn- find-cycle
   "A require path from `start` back to itself, or nil."
@@ -423,76 +428,19 @@
 ;; Source side: the require back to the moved forms
 ;; ============================================================
 
-(defn- symbols-vector-node [symbols]
-  (n/vector-node (vec (interpose (n/spaces 1) (map n/token-node symbols)))))
-
-(defn- add-refers-to-existing-libspec
-  "Add `refers` to the source's libspec for `target-ns`, keeping its alias."
-  [text target-ns refers]
-  (let [require-loc (ns-clause (ns-zloc text) ":require")
-        entry (->> (some-> require-loc z/down z/right)
-                   (iterate z/right)
-                   (take-while some?)
-                   (filter #(and (z/vector? %)
-                                 (= target-ns (some-> % z/down z/string))))
-                   first)
-        refer-loc (->> (z/down entry)
-                       (iterate z/right)
-                       (take-while some?)
-                       (filter #(= ":refer" (z/string %)))
-                       first)
-        existing-vector (some-> refer-loc z/right)
-        combined (fn [existing]
-                   (vec (distinct (concat existing (map symbol refers)))))]
-    (if (some-> existing-vector z/vector?)
-      (-> existing-vector
-          (z/replace (symbols-vector-node (combined (z/sexpr existing-vector))))
-          z/root-string)
-      (-> entry
-          (z/append-child* (n/spaces 1))
-          (z/append-child* (n/keyword-node :refer))
-          (z/append-child* (n/spaces 1))
-          (z/append-child* (symbols-vector-node (combined [])))
-          z/root-string))))
-
 (defn- require-target-from-source [text target-ns refers]
   (if (empty? refers)
     text
     (let [specs (header/libspec-entries (ns-form-source text))
           existing (some #(when (= target-ns (str (:namespace %))) %) (:entries specs))]
       (if existing
-        (add-refers-to-existing-libspec text target-ns refers)
+        (move-callers/add-refers text target-ns refers)
         (let [aliases (:aliases (header/source-aliases (ns-form-source text)))]
           (require-ops/insert-into-require-sorted
             text (symbol target-ns) (header/allocate-alias target-ns aliases) refers))))))
 
 ;; Requires the move leaves unused
 ;; ------------------------------------------------------------
-
-(defn- remove-libspecs
-  "Remove the :require entries naming `namespaces`, and the :require clause
-  itself when nothing is left in it."
-  [text namespaces]
-  (let [doomed (set namespaces)
-        clause-loc (ns-clause (ns-zloc text) ":require")]
-    (loop [loc (some-> clause-loc z/down z/right)
-           clause clause-loc]
-      (cond
-        (nil? loc)
-        (if (some-> clause z/down z/right)
-          (z/root-string clause)
-          (-> clause z/remove z/root-string))
-
-        (and (z/vector? loc) (contains? doomed (some-> loc z/down z/string)))
-        ;; z/remove lands on the previous node depth-first, which may sit
-        ;; inside the previous libspec; climb back to the :require clause.
-        (let [clause' (loop [l (z/remove loc)]
-                        (if (and (z/list? l) (= ":require" (some-> l z/down z/string)))
-                          l
-                          (recur (z/up l))))]
-          (recur (some-> clause' z/down z/right) clause'))
-
-        :else (recur (z/right loc) clause)))))
 
 (defn- drop-unused-requires
   "Remove source libspecs that only the moved forms used. A libspec with no
@@ -541,7 +489,8 @@
           :error-type error-type
           :error error
           :source-unchanged true
-          :target-unchanged true}
+          :target-unchanged true
+          :files-unchanged true}
          data))
 
 ;; ============================================================
@@ -569,6 +518,7 @@
                   :target-ns target-ns
                   :workspace-sources workspace-sources
                   :require-policy :copy-all
+                  :quoted-var-proof false
                   :public-forms (vec (:public-forms opts))
                   :derive-required-public-forms (not (contains? opts :public-forms))}))
         moved (set (map str forms))
@@ -602,17 +552,29 @@
                                                       sort vec)]
                                        (when (seq calls) {:form form-name :calls calls}))))
                              vec)
-            target-alias-for-source (->> (:entries (header/libspec-entries
-                                                     (ns-form-source target)))
-                                         (keep #(when (= source-ns (str (:namespace %)))
-                                                  (some-> % :alias str)))
-                                         set)
-            target-references (->> (token-matches target #"(?:#')?([^:/][^/]*)/(.+)")
-                                   (filter (fn [[_ prefix local]]
-                                             (and (or (= prefix source-ns)
-                                                      (contains? target-alias-for-source prefix))
-                                                  (contains? moved local))))
-                                   (mapv first))]
+            rewrite (fn [path text mode]
+                      (move-callers/rewrite-caller
+                        {:file path :text text :mode mode :moved moved
+                         :source-ns source-ns :target-ns target-ns :target-file target-file}))
+            ;; Every caller spells the source namespace: in a libspec, an
+            ;; alias declaration or a qualified name. A prefix-list libspec
+            ;; spells only its last segment.
+            last-segment (last (str/split source-ns #"\."))
+            candidate? (fn [text]
+                         (and (some #(str/includes? text %) moved)
+                              (or (str/includes? text source-ns)
+                                  (str/includes? text last-segment))))
+            rewrite-callers (fn []
+                              (let [target-self (rewrite target-file target :target)
+                                    results (->> (dissoc workspace-sources source-file target-file)
+                                                 (sort-by key)
+                                                 (filter (comp candidate? val))
+                                                 (mapv (fn [[path text]] (rewrite path text :caller))))]
+                                {:target-self target-self
+                                 :unrewritable (vec (mapcat :problems (cons target-self results)))
+                                 :callers (filterv :changed results)}))
+            {:keys [target-self unrewritable callers]} (when (empty? left-behind)
+                                                         (rewrite-callers))]
         (cond
           (seq left-behind)
           (refusal :left-behind-dependencies
@@ -625,11 +587,11 @@
                                          distinct sort vec)
                    :next-step "Move the suggested forms together, or keep the moved form in the source")
 
-          (seq target-references)
-          (refusal :target-references-moved-form
-                   "The target calls a moved form through the source namespace"
-                   :references (vec (distinct target-references))
-                   :next-step "Rewrite those references first; caller rewriting is not built yet")
+          (seq unrewritable)
+          (refusal :caller-not-rewritable
+                   "A reference to a moved form cannot be rewritten exactly"
+                   :references unrewritable
+                   :next-step "Change or remove each listed reference, then move again")
 
           :else
           (let [ordered (vec (sort-by :line (:_form-texts plan)))
@@ -639,7 +601,7 @@
                                (:text %))
                             ordered)
                 merged (merge-requires {:source-ns-form (ns-form-source source)
-                                        :target target
+                                        :target (:text target-self)
                                         :target-ns target-ns
                                         :form-sources texts})]
             (if-not (:ok merged)
@@ -685,10 +647,9 @@
                                     str/trimr
                                     (str "\n"))
                         graph (into {}
-                                    (map (fn [text]
-                                           [(some-> (ns-zloc text) z/down z/right z/string)
-                                            (required-namespaces text)]))
-                                    (concat (vals (dissoc workspace-sources source-file target-file))
+                                    (keep ns-requires)
+                                    (concat (vals (merge (dissoc workspace-sources source-file target-file)
+                                                    (into {} (map (juxt :file :text)) callers)))
                                             [source' target']))
                         cycle (or (find-cycle graph source-ns) (find-cycle graph target-ns))
                         target-order (mapv :name (filter #(defining? project-aliases %)
@@ -706,6 +667,9 @@
                                           :keywords auto-keywords
                                           :meaning (str "These now name the target namespace instead of "
                                                         source-ns)})
+                                   (seq callers)
+                                   (into (mapcat :warnings callers))
+
                                    (seq late-uses)
                                    (into (for [[form-name uses] late-uses]
                                            {:type :used-before-definition
@@ -734,5 +698,11 @@
                          :qualifiers-rewritten (:qualifiers-rewritten merged)
                          :source-referred-forms (:_source-referred-forms plan)
                          :warnings warnings
-                         :callers-to-review (:callers-to-review plan)
-                         :quoted-var-references (:quoted-var-references plan)}))))))))))))
+                         :callers (into {} (map (juxt :file :text)) callers)
+                         :callers-rewritten (mapv (fn [{:keys [file rewritten requires-added requires-removed]}]
+                                                    {:file file
+                                                     :rewritten (count rewritten)
+                                                     :requires-added requires-added
+                                                     :requires-removed requires-removed})
+                                                  callers)
+                         :callers-to-review (mapv :file callers)}))))))))))))

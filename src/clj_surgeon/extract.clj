@@ -323,11 +323,13 @@
 ;; @spec MCP-OP-PLAN-006
 (defn compile-plan
   "Purely compile an extraction plan from one source snapshot and a captured
-  workspace source map. No file, process, clock, or registry access occurs."
+  workspace source map. No file, process, clock, or registry access occurs.
+  :quoted-var-proof false skips the quoted-Var scan for a caller that
+  rewrites those references itself."
   [{:keys [file source forms to target-ns workspace-sources require-policy
-           public-forms derive-required-public-forms]
+           public-forms derive-required-public-forms quoted-var-proof]
     :or {workspace-sources {} require-policy :minimal public-forms []
-         derive-required-public-forms false}}]
+         derive-required-public-forms false quoted-var-proof true}}]
   (let [lines (vec (str/split-lines source))
         ol (outline/outline-source file source)
         all-forms (:forms ol)
@@ -477,8 +479,9 @@
                  sort
                  vec)
             subjects (mapv #(str source-ns "/" %) (sort extracted-names))
-            quoted-proof (quoted-var-refs/scan-sources
-                           captured-sources subjects)]
+            quoted-proof (if quoted-var-proof
+                           (quoted-var-refs/scan-sources captured-sources subjects)
+                           {:ok true :locations []})]
         (cond
           (seq invalid-public-forms)
           {:error "public-forms must name selected private forms"

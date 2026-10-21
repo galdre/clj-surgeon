@@ -375,7 +375,7 @@
     (is (str/includes? apply-help "parses them, hash-fences the source"))
     (is (str/includes? apply-help "roll back"))
     (is (str/includes? apply-help ":undo-extract!"))
-    (is (str/includes? undo-help "both result files still match"))
+    (is (str/includes? undo-help "every result file still matches"))
     (is (str/includes? undo-help "refuses before writing"))))
 
 ;; ============================================================

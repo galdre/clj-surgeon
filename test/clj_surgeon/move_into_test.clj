@@ -212,11 +212,66 @@
     (is (= :meaning-change (:error-type r)))
     (is (= "clojure.string/join" (-> r :changes first :in-target)))))
 
-(deftest a-target-that-calls-the-moved-form-through-the-source-refuses
+(deftest a-target-that-calls-the-moved-form-through-the-source-calls-it-by-name
   (let [r (move "(ns app.source)\n\n(defn f [] 1)\n"
                 "(ns app.target\n  (:require [app.source :as src]))\n\n(defn g [] (src/f))\n"
                 '[f] {:at-end true})]
-    (is (= :target-references-moved-form (:error-type r)))))
+    (is (:ok r))
+    (testing "the require of the source goes with its last use, so no cycle"
+      (is (= "(ns app.target)\n\n(defn g [] (f))\n\n(defn f [] 1)\n" (:target r))))
+    (is (= "(ns app.source)\n" (:source r)))))
+
+;; Field shape (invoice trial follow-up): a test reaches the moved private
+;; helper through a fully qualified var quote.
+(deftest callers-in-other-files-are-rewritten
+  (let [test-file "test/app/source_test.clj"
+        report "src/app/report.clj"
+        r (move "(ns app.source)\n\n(defn- f [] 1)\n\n(defn main [] (f))\n"
+                "(ns app.target)\n"
+                '[f] {:at-end true}
+                :workspace-sources
+                {test-file (str "(ns app.source-test\n"
+                                "  (:require\n"
+                                "   [app.source]\n"
+                                "   [clojure.test :refer [deftest is]]))\n\n"
+                                "(deftest f-is-one (is (= 1 (#'app.source/f))))\n")
+                 report (str "(ns app.report\n"
+                             "  (:require [app.source :as s]))\n\n"
+                             "(defn row [] [(s/f) (s/main)])\n")
+                 "src/app/unrelated.clj" "(ns app.unrelated)\n\n(defn g [f] (f))\n"})]
+    (is (:ok r))
+    (is (= [report test-file] (sort (keys (:callers r)))))
+    (is (str/includes? (get-in r [:callers test-file]) "(#'app.target/f)"))
+    (is (str/includes? (get-in r [:callers test-file]) "   [app.source]\n   [app.target]\n"))
+    (is (str/includes? (get-in r [:callers report]) "[(target/f) (s/main)]"))
+    (is (= [{:file report :rewritten 1 :requires-added ["app.target"] :requires-removed []}
+            {:file test-file :rewritten 1 :requires-added ["app.target"] :requires-removed []}]
+           (:callers-rewritten r)))
+    (is (= [report test-file] (:callers-to-review r)))))
+
+(deftest a-caller-that-cannot-be-rewritten-refuses-before-any-write
+  (let [r (move "(ns app.source)\n\n(defn f [] 1)\n"
+                "(ns app.target)\n"
+                '[f] {:at-end true}
+                :workspace-sources
+                {"src/app/a.clj" "(ns app.a\n  (:require [app.source :refer :all]))\n\n(defn g [] (f))\n"
+                 "src/app/b.cljs" "(ns app.b\n  (:require [app.source :as s]))\n\n(defn g [] (s/f))\n"})]
+    (is (= :caller-not-rewritable (:error-type r)))
+    (is (= [{:file "src/app/a.clj" :line 4 :reason :refer-all :text "f"}
+            {:file "src/app/b.cljs" :line 4 :reason :target-platform :text "s/f"}]
+           (:references r)))
+    (is (:files-unchanged r))))
+
+(deftest a-caller-rewrite-that-would-close-a-require-cycle-refuses
+  ;; The target requires app.report; rewriting app.report's call makes
+  ;; app.report require the target.
+  (let [r (move "(ns app.source)\n\n(defn f [] 1)\n"
+                "(ns app.target\n  (:require [app.report :as report]))\n\n(defn g [] (report/row))\n"
+                '[f] {:at-end true}
+                :workspace-sources
+                {"src/app/report.clj" "(ns app.report\n  (:require [app.source :as s]))\n\n(defn row [] (s/f))\n"})]
+    (is (= :circular-require (:error-type r)))
+    (is (= ["app.target" "app.report" "app.target"] (:cycle r)))))
 
 (deftest a-move-that-would-make-namespaces-require-each-other-refuses
   ;; Before the move: target -> middle -> source, no cycle. The source keeps a

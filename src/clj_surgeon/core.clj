@@ -661,6 +661,7 @@
                                    :at-start       {:desc "With --into-existing: place the forms directly after the target's ns form"}
                                    :at-end         {:desc "With --into-existing: place the forms after the target's last form"}
                                    :public-forms   {:desc "EDN vector of moved private forms to make public. Omit it to publicize every moved private form that remaining source still calls"}
+                                   :source-roots   {:desc "With --into-existing: EDN vector of workspace-relative directories to scan for callers, e.g. '[\"src\" \"test\"]'. Default: the roots deps.edn and bb.edn declare, plus src, test and dev"}
                                    :require-policy {:desc ":minimal (default) proves exact requires; :copy-all preserves the complete source ns header as a conservative starting point"}}
                        :examples  ["clj-surgeon :op :extract :file src/state.clj :forms '[distill refine]' :to src/distillery.clj"]
                        :category  :write
@@ -680,23 +681,26 @@
                                    :at-start       {:desc "With --into-existing: place the forms directly after the target's ns form"}
                                    :at-end         {:desc "With --into-existing: place the forms after the target's last form"}
                                    :public-forms   {:desc "EDN vector of moved private forms to make public. Omit it to publicize every moved private form that remaining source still calls; a list that omits one refuses"}
+                                   :source-roots   {:desc "With --into-existing: EDN vector of workspace-relative directories to scan for callers, e.g. '[\"src\" \"test\"]'. Default: the roots deps.edn and bb.edn declare, plus src, test and dev"}
                                    :require-policy {:desc ":minimal (default) proves exact requires; :copy-all preserves the complete source ns header as a conservative starting point"}
                                    :receipt-out    {:desc "Optional new .edn path for a guarded inverse receipt"}}
                        :workflow  ["Run :extract first. Review target-requires, omitted-target-requires, remaining-source-callers, callers-to-review, and authority-labeled quoted-var-references. Unsupported require shapes refuse instead of copying or dropping unproved dependencies."
                                    "Application compiles both complete files from one source snapshot, parses them, hash-fences the source, writes atomically, and verifies read-back."
                                    "Existing targets, stale source, invalid candidates, receipt aliases, and handled write failures refuse or roll back without leaving a partial extraction."
                                    "Use :receipt-out when the extraction must be reversible. Pass that path to :undo-extract!; do not edit the receipt."
-                                   "With --into-existing, name exactly one of --above FORM, --below FORM, --at-start, --at-end. The plan refuses name clashes, symbols that would mean something else in the target, forms left behind that the moved forms call, alias conflicts and circular requires before any write. A new clj-kondo error after the write restores both files."]
-                       :examples  ["clj-surgeon :op :extract! :file src/state.clj :forms '[distill refine]' :to src/distillery.clj :receipt-out /tmp/distillery-extract.edn"]
+                                   "With --into-existing, name exactly one of --above FORM, --below FORM, --at-start, --at-end. Callers in other files are rewritten: aliased and fully qualified references and var quotes move to the target, referred names move to the target libspec, and requires are added or removed to match. The plan refuses name clashes, symbols that would mean something else in the target, forms left behind that the moved forms call, alias conflicts, references it cannot rewrite exactly (:caller-not-rewritable) and circular requires before any write. Every file is hash-fenced; a new clj-kondo error in any written file restores them all."]
+                       :examples  ["clj-surgeon :op :extract! :file src/state.clj :forms '[distill refine]' :to src/distillery.clj :receipt-out /tmp/distillery-extract.edn"
+                                   "clj-surgeon extract! --file src/billing/invoice.clj --forms '[has-email?]' --to src/billing/customer.clj --into-existing --below email --receipt-out /tmp/move.edn"]
                        :category  :write
                        :pair      :extract}
 
     :undo-extract!    {:handler   move-into-shell/undo!
-                       :desc      "Undo an extraction while both result files still match its receipt"
+                       :desc      "Undo an extraction or a move into an existing namespace while every result file still matches its receipt"
                        :args      {:receipt {:required true :desc "Guarded .edn receipt emitted by :extract!"}}
                        :workflow  ["Supply the unchanged receipt emitted by :extract!."
                                    "The command refuses before writing when either extraction result has changed or disappeared."
-                                   "Success restores the original source and removes only the exact target created by that extraction."]
+                                   "Success restores the original source and removes only the exact target created by that extraction."
+                                   "A receipt from extract! --into-existing restores every file the move wrote, and refuses before writing when any of them has changed."]
                        :examples  ["clj-surgeon :op :undo-extract! :receipt /tmp/distillery-extract.edn"]
                        :category  :write}
 

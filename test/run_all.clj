@@ -25,6 +25,7 @@
    [clj-surgeon.intent-transaction-test]
    [clj-surgeon.lens-query-test]
    [clj-surgeon.ls-tree-test]
+   [clj-surgeon.move-callers-test]
    [clj-surgeon.move-dependency-test]
    [clj-surgeon.move-into-shell-test]
    [clj-surgeon.move-into-test]
@@ -55,6 +56,7 @@
                    'clj-surgeon.operation-algebra-test
                    'clj-surgeon.move-dependency-test
                    'clj-surgeon.move-into-test
+                   'clj-surgeon.move-callers-test
                    'clj-surgeon.move-into-shell-test
                    'clj-surgeon.analyze-test
                    'clj-surgeon.diagnostic-delta-test

@@ -19,9 +19,15 @@ is cut.
   source requires that only the moved forms used. It refuses
   unknown or ambiguous anchors, name clashes, symbols whose meaning would
   change, forms left behind that a moved form calls, alias conflicts and
-  circular requires before writing. A new clj-kondo error after the write
-  restores both files; `undo-extract!` restores both from the receipt.
-  Callers in other files are reported, not yet rewritten.
+  circular requires before writing. Callers in other files are rewritten in
+  the same move: aliased references through the caller's alias for the
+  target, fully qualified references and var quotes with the new namespace,
+  and referred names on the target libspec; requires are added at their
+  sorted positions and removed when a rewrite leaves them unused. A reference
+  that cannot be rewritten exactly refuses with `:caller-not-rewritable`.
+  Callers are found under the declared source roots, or `--source-roots`.
+  Every file is hash-fenced; a new clj-kondo error in any written file
+  restores them all, and `undo-extract!` restores them all from the receipt.
   Plan: `docs/plans/move-into-existing-namespace.md`.
 
 - The CLI accepts GNU-style arguments: `clj-surgeon ls --file src/a.clj`,
