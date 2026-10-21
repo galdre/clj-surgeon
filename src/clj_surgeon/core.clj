@@ -18,6 +18,7 @@
    [clj-surgeon.edit-dsl :as edit-dsl]
    [clj-surgeon.extract :as extract]
    [clj-surgeon.fix-declares :as fix-declares]
+   [clj-surgeon.move-into-shell :as move-into-shell]
    [clj-surgeon.forms :as forms]
    [clj-surgeon.forward-refs :as fwd]
    [clj-surgeon.intent-transaction :as intent-transaction]
@@ -646,34 +647,51 @@
                                    "clj-surgeon :op :deps :file src/my/ns.clj :form sync-draft!"]
                        :category  :read}
 
-    :extract          {:handler   extract/plan
+    :extract          {:handler   (fn [opts]
+                                    (if (:into-existing opts)
+                                      (move-into-shell/plan-summary opts)
+                                      (extract/plan opts)))
                        :desc      "Plan dependency-minimal form extraction with caller and quoted-Var proof (dry run)"
                        :args      {:file           {:required true :desc "Source file"}
                                    :forms          {:required true :desc "EDN vector of form names, e.g. '[foo bar]'"}
                                    :to             {:required true :desc "Target file path for new namespace"}
+                                   :into-existing  {:desc "true to move the forms into a target namespace file that already exists"}
+                                   :above          {:desc "With --into-existing: place the forms above this target form, e.g. email or 'defmethod render :card'"}
+                                   :below          {:desc "With --into-existing: place the forms below this target form"}
+                                   :at-start       {:desc "With --into-existing: place the forms directly after the target's ns form"}
+                                   :at-end         {:desc "With --into-existing: place the forms after the target's last form"}
                                    :public-forms   {:desc "EDN vector of moved private forms to make public. Omit it to publicize every moved private form that remaining source still calls"}
                                    :require-policy {:desc ":minimal (default) proves exact requires; :copy-all preserves the complete source ns header as a conservative starting point"}}
                        :examples  ["clj-surgeon :op :extract :file src/state.clj :forms '[distill refine]' :to src/distillery.clj"]
                        :category  :write
                        :pair      :extract!}
 
-    :extract!         {:handler   extract/execute!
+    :extract!         {:handler   (fn [opts]
+                                    (if (:into-existing opts)
+                                      (move-into-shell/execute! opts)
+                                      (extract/execute! opts)))
                        :desc      "Execute one failure-atomic form extraction to a new namespace"
                        :args      {:file           {:required true :desc "Source file"}
                                    :forms          {:required true :desc "EDN vector of form names"}
-                                   :to             {:required true :desc "New target file; existing files refuse"}
+                                   :to             {:required true :desc "Target file; an existing file refuses unless --into-existing is given"}
+                                   :into-existing  {:desc "true to move the forms into a target namespace file that already exists"}
+                                   :above          {:desc "With --into-existing: place the forms above this target form, e.g. email or 'defmethod render :card'"}
+                                   :below          {:desc "With --into-existing: place the forms below this target form"}
+                                   :at-start       {:desc "With --into-existing: place the forms directly after the target's ns form"}
+                                   :at-end         {:desc "With --into-existing: place the forms after the target's last form"}
                                    :public-forms   {:desc "EDN vector of moved private forms to make public. Omit it to publicize every moved private form that remaining source still calls; a list that omits one refuses"}
                                    :require-policy {:desc ":minimal (default) proves exact requires; :copy-all preserves the complete source ns header as a conservative starting point"}
                                    :receipt-out    {:desc "Optional new .edn path for a guarded inverse receipt"}}
                        :workflow  ["Run :extract first. Review target-requires, omitted-target-requires, remaining-source-callers, callers-to-review, and authority-labeled quoted-var-references. Unsupported require shapes refuse instead of copying or dropping unproved dependencies."
                                    "Application compiles both complete files from one source snapshot, parses them, hash-fences the source, writes atomically, and verifies read-back."
                                    "Existing targets, stale source, invalid candidates, receipt aliases, and handled write failures refuse or roll back without leaving a partial extraction."
-                                   "Use :receipt-out when the extraction must be reversible. Pass that path to :undo-extract!; do not edit the receipt."]
+                                   "Use :receipt-out when the extraction must be reversible. Pass that path to :undo-extract!; do not edit the receipt."
+                                   "With --into-existing, name exactly one of --above FORM, --below FORM, --at-start, --at-end. The plan refuses name clashes, symbols that would mean something else in the target, forms left behind that the moved forms call, alias conflicts and circular requires before any write. A new clj-kondo error after the write restores both files."]
                        :examples  ["clj-surgeon :op :extract! :file src/state.clj :forms '[distill refine]' :to src/distillery.clj :receipt-out /tmp/distillery-extract.edn"]
                        :category  :write
                        :pair      :extract}
 
-    :undo-extract!    {:handler   extract/undo!
+    :undo-extract!    {:handler   move-into-shell/undo!
                        :desc      "Undo an extraction while both result files still match its receipt"
                        :args      {:receipt {:required true :desc "Guarded .edn receipt emitted by :extract!"}}
                        :workflow  ["Supply the unchanged receipt emitted by :extract!."
