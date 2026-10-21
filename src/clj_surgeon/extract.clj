@@ -226,6 +226,13 @@
       (remove-form-ranges partial-edited emptied)
       partial-edited)))
 
+(defn source-without-forms
+  "The source with the planned forms removed, and their names removed from
+  its declare forms. Pure."
+  [source form-ranges]
+  (-> (remove-form-ranges source form-ranges)
+      (drop-moved-declares (map :name form-ranges))))
+
 (defn- validate-complete-source!
   [file source]
   (try
@@ -242,8 +249,7 @@
   "Purely compile and parse the complete source and target after extraction."
   [{:keys [source source-file target-file form-ranges target-source target-ns
            target-alias source-referred-forms]}]
-  (let [source-without-forms (-> (remove-form-ranges source form-ranges)
-                                 (drop-moved-declares (map :name form-ranges)))
+  (let [source-without-forms (source-without-forms source form-ranges)
         future-source (if (seq source-referred-forms)
                         (add-require-to-ns source-without-forms
                                            target-ns

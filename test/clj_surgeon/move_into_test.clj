@@ -158,3 +158,126 @@
                           ["(defn f [] (g))"])]
     (is (= :refer-merge-unsupported (:error-type r)))
     (is (= [{:namespace "b.lib" :symbols ["g"]}] (:missing-refers r)))))
+
+;; ============================================================
+;; The complete move: refusals, warnings, both files
+;; ============================================================
+
+(defn- move [source target forms anchor & {:as extra}]
+  (move-into/compile-move
+    (merge {:source-file "src/app/source.clj"
+            :source source
+            :target-file "src/app/target.clj"
+            :target target
+            :target-ns "app.target"
+            :forms forms
+            :anchor anchor
+            :project-aliases {}
+            :workspace-sources {}}
+           extra)))
+
+(deftest a-name-the-target-defines-refuses
+  (let [r (move "(ns app.source)\n\n(defn f [] 1)\n\n(defn main [] (f))\n"
+                "(ns app.target)\n\n(defn f [] 2)\n"
+                '[f] {:at-end true})]
+    (is (= :name-clash (:error-type r)))
+    (is (= ["f"] (:names r)))))
+
+(deftest a-form-left-behind-refuses-with-the-set-to-move
+  (let [r (move (str "(ns app.source)\n\n"
+                     "(defn- helper [x] (* 2 x))\n\n"
+                     "(defn uses-helper [x] (helper x))\n\n"
+                     "(defn main [] (uses-helper 3))\n")
+                "(ns app.target)\n"
+                '[uses-helper] {:at-end true})]
+    (is (= :left-behind-dependencies (:error-type r)))
+    (is (= [{:form "uses-helper" :calls ["helper"]}] (:left-behind r)))
+    (is (= ["helper" "uses-helper"] (:suggested-forms r)))))
+
+;; Field case (invoice trial): billing.customer excludes clojure.core/name and
+;; defines its own name accessor.
+(deftest a-symbol-that-means-something-else-in-the-target-refuses
+  (let [r (move "(ns app.source)\n\n(defn label [k] (name k))\n\n(defn main [] (label :x))\n"
+                (str "(ns app.target\n  (:refer-clojure :exclude [name]))\n\n"
+                     "(defn name [c] (:name c))\n")
+                '[label] {:at-end true})]
+    (is (= :meaning-change (:error-type r)))
+    (is (= [{:symbol "name" :in-source "clojure.core/name" :in-target "app.target/name"}]
+           (:changes r)))))
+
+(deftest a-symbol-the-target-refers-from-another-library-refuses
+  (let [r (move "(ns app.source)\n\n(defn f [xs] (join xs))\n\n(defn main [] (f []))\n"
+                "(ns app.target\n  (:require [clojure.string :refer [join]]))\n"
+                '[f] {:at-end true})]
+    (is (= :meaning-change (:error-type r)))
+    (is (= "clojure.string/join" (-> r :changes first :in-target)))))
+
+(deftest a-target-that-calls-the-moved-form-through-the-source-refuses
+  (let [r (move "(ns app.source)\n\n(defn f [] 1)\n"
+                "(ns app.target\n  (:require [app.source :as src]))\n\n(defn g [] (src/f))\n"
+                '[f] {:at-end true})]
+    (is (= :target-references-moved-form (:error-type r)))))
+
+(deftest a-move-that-would-make-namespaces-require-each-other-refuses
+  ;; Before the move: target -> middle -> source, no cycle. The source keeps a
+  ;; caller of f, so it must require the target, which closes the loop.
+  (let [r (move "(ns app.source)\n\n(defn f [] 1)\n\n(defn main [] (f))\n"
+                "(ns app.target\n  (:require [app.middle :as m]))\n\n(defn g [] (m/h))\n"
+                '[f] {:at-end true}
+                :workspace-sources {"src/app/middle.clj"
+                                    "(ns app.middle\n  (:require [app.source :as s]))\n\n(defn h [] 1)\n"})]
+    (is (= :circular-require (:error-type r)))
+    (is (= ["app.source" "app.target" "app.middle" "app.source"] (:cycle r)))))
+
+(deftest unqualified-auto-resolved-keywords-move-with-a-warning
+  (let [r (move "(ns app.source)\n\n(defn f [m] (::id m))\n\n(defn main [] (f {}))\n"
+                "(ns app.target)\n"
+                '[f] {:at-end true})]
+    (is (:ok r))
+    (is (str/includes? (:target r) "(::id m)"))
+    (is (= [{:type :auto-resolved-keywords-moved :keywords ["::id"]
+             :meaning "These now name the target namespace instead of app.source"}]
+           (:warnings r)))))
+
+(deftest a-form-placed-above-what-it-calls-moves-with-a-warning
+  (let [r (move "(ns app.source\n  (:require [app.target :as t]))\n\n(defn f [] (t/g))\n\n(defn main [] (f))\n"
+                "(ns app.target)\n\n(defn g [] 1)\n"
+                '[f] {:above "g"})]
+    (is (:ok r))
+    (is (str/includes? (:target r) "(defn f [] (g))\n\n(defn g [] 1)"))
+    (is (= [{:type :used-before-definition :form "f" :uses ["g"]}]
+           (:warnings r)))))
+
+(deftest moved-forms-that-call-each-other-carry-a-declare
+  (let [r (move (str "(ns app.source)\n\n(declare odd?*)\n\n"
+                     "(defn even?* [n] (if (zero? n) true (odd?* (dec n))))\n\n"
+                     "(defn odd?* [n] (if (zero? n) false (even?* (dec n))))\n\n"
+                     "(defn main [] (even?* 4))\n")
+                "(ns app.target)\n"
+                '[even?* odd?*] {:at-end true})]
+    (is (:ok r))
+    (is (str/includes? (:target r) "(declare odd?*)\n\n(defn even?*"))
+    (is (not (str/includes? (:source r) "declare")))))
+
+(deftest the-source-requires-the-target-for-its-remaining-callers
+  (testing "a new libspec when the source does not require the target yet"
+    (let [r (move "(ns app.source)\n\n(defn f [] 1)\n\n(defn main [] (f))\n"
+                  "(ns app.target)\n" '[f] {:at-end true})]
+      (is (str/includes? (:source r) "[app.target :as target :refer [f]]"))))
+  (testing "a :refer added to the existing libspec when it does"
+    (let [r (move (str "(ns app.source\n  (:require [app.target :as t]))\n\n"
+                       "(defn f [] (t/g))\n\n(defn main [] [(f) (t/g)])\n")
+                  "(ns app.target)\n\n(defn g [] 1)\n" '[f] {:at-end true})]
+      (is (str/includes? (:source r) "[app.target :as t :refer [f]]"))
+      (is (= 1 (count (re-seq #"app\.target" (:source r)))))))
+  (testing "both results parse"
+    (let [r (move "(ns app.source)\n\n(defn f [] 1)\n\n(defn main [] (f))\n"
+                  "(ns app.target)\n" '[f] {:at-end true})]
+      (is (some? (parser/parse-string-all (:source r))))
+      (is (some? (parser/parse-string-all (:target r)))))))
+
+(deftest a-private-form-the-source-still-calls-becomes-public
+  (let [r (move "(ns app.source)\n\n(defn- f [] 1)\n\n(defn main [] (f))\n"
+                "(ns app.target)\n" '[f] {:at-end true})]
+    (is (= ["f"] (:public-forms r)))
+    (is (str/includes? (:target r) "(defn f [] 1)"))))

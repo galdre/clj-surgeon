@@ -6,9 +6,12 @@
    shell in clj-surgeon.extract reads the files, writes the result
    atomically, lints it, and rolls back on a new error."
   (:require
+   [clj-surgeon.analyze :as analyze]
    [clj-surgeon.cljc.require-ops :as require-ops]
+   [clj-surgeon.extract :as extract]
    [clj-surgeon.extract-header :as header]
    [clj-surgeon.forms :as forms]
+   [clojure.set :as set]
    [clojure.string :as str]
    [rewrite-clj.node :as n]
    [rewrite-clj.parser :as parser]
@@ -314,3 +317,375 @@
              :form-sources (mapv :source results)
              :requires-added (mapv :namespace additions)
              :qualifiers-rewritten (vec (distinct (mapcat :rewritten results)))}))))))
+
+;; ============================================================
+;; What a symbol means in a namespace
+;; ============================================================
+
+(def ^:private special-forms
+  #{"if" "do" "let*" "fn*" "loop*" "recur" "throw" "try" "catch" "finally"
+    "quote" "var" "def" "new" "set!" "." "letfn*" "case*" "monitor-enter"
+    "monitor-exit" "import*" "deftype*" "reify*" "&"})
+
+(def ^:private core-names
+  (into special-forms (map str) (keys (ns-publics 'clojure.core))))
+
+(defn- ns-zloc [text]
+  (some->> (z/of-string text)
+           (iterate z/right)
+           (take-while some?)
+           (filter #(and (z/list? %) (= "ns" (some-> % z/down z/string))))
+           first))
+
+(defn- ns-clause [ns-loc keyword-text]
+  (some->> (some-> ns-loc z/down)
+           (iterate z/right)
+           (take-while some?)
+           (filter #(and (z/list? %) (= keyword-text (some-> % z/down z/string))))
+           first))
+
+(defn- core-filter
+  "The :refer-clojure :exclude / :only options of a namespace."
+  [text]
+  (let [clause (some-> (ns-zloc text) (ns-clause ":refer-clojure") z/sexpr)
+        options (when clause (apply hash-map (rest clause)))]
+    {:exclude (set (map str (:exclude options)))
+     :only (some->> (:only options) (map str) set)}))
+
+(defn- namespace-context
+  "What unqualified symbols resolve to in a namespace: its definitions, its
+  referred symbols, and its view of clojure.core."
+  [text project-aliases extra-definitions]
+  (let [specs (header/libspec-entries (ns-form-source text))]
+    {:ns-name (some-> (ns-zloc text) z/down z/right z/string)
+     :definitions (into (set extra-definitions)
+                        (comp (filter #(defining? project-aliases %))
+                              (map :name))
+                        (top-level-forms text))
+     :refers (into {}
+                   (for [{:keys [namespace referred]} (:entries specs)
+                         :when (vector? referred)
+                         symbol referred]
+                     [(str symbol) (str namespace)]))
+     :core (core-filter text)}))
+
+(defn- resolve-symbol [{:keys [ns-name definitions refers core]} sym]
+  (cond
+    (contains? definitions sym) (str ns-name "/" sym)
+    (contains? refers sym) (str (get refers sym) "/" sym)
+    (and (contains? core-names sym)
+         (not (contains? (:exclude core) sym))
+         (or (nil? (:only core)) (contains? (:only core) sym)))
+    (str "clojure.core/" sym)
+    :else nil))
+
+;; ============================================================
+;; Require graph
+;; ============================================================
+
+(defn- required-namespaces
+  "Namespaces named in the :require and :use clauses of a namespace, read
+  leniently: vectors, bare symbols, and prefix lists."
+  [text]
+  (let [loc (ns-zloc text)
+        clauses (keep #(some-> loc (ns-clause %) z/sexpr) [":require" ":use"])]
+    (set
+      (for [clause clauses
+            entry (rest clause)
+            lib (cond
+                  (symbol? entry) [entry]
+                  (vector? entry) [(first entry)]
+                  (seq? entry) (for [child (rest entry)]
+                                 (symbol (str (first entry) "."
+                                              (if (vector? child) (first child) child))))
+                  :else [])]
+        (str lib)))))
+
+(defn- find-cycle
+  "A require path from `start` back to itself, or nil."
+  [graph start]
+  (loop [stack [[start [start]]]
+         seen #{}]
+    (when-let [[node path] (peek stack)]
+      (let [stack (pop stack)
+            nexts (get graph node #{})]
+        (if (and (> (count path) 1) (= node start))
+          path
+          (if (and (contains? seen node) (not= node start))
+            (recur stack seen)
+            (recur (into stack (for [next-node (sort nexts)
+                                     :when (or (= next-node start)
+                                               (not (contains? seen next-node)))]
+                                 [next-node (conj path next-node)]))
+                   (conj seen node))))))))
+
+;; ============================================================
+;; Source side: the require back to the moved forms
+;; ============================================================
+
+(defn- symbols-vector-node [symbols]
+  (n/vector-node (vec (interpose (n/spaces 1) (map n/token-node symbols)))))
+
+(defn- add-refers-to-existing-libspec
+  "Add `refers` to the source's libspec for `target-ns`, keeping its alias."
+  [text target-ns refers]
+  (let [require-loc (ns-clause (ns-zloc text) ":require")
+        entry (->> (some-> require-loc z/down z/right)
+                   (iterate z/right)
+                   (take-while some?)
+                   (filter #(and (z/vector? %)
+                                 (= target-ns (some-> % z/down z/string))))
+                   first)
+        refer-loc (->> (z/down entry)
+                       (iterate z/right)
+                       (take-while some?)
+                       (filter #(= ":refer" (z/string %)))
+                       first)
+        existing-vector (some-> refer-loc z/right)
+        combined (fn [existing]
+                   (vec (distinct (concat existing (map symbol refers)))))]
+    (if (some-> existing-vector z/vector?)
+      (-> existing-vector
+          (z/replace (symbols-vector-node (combined (z/sexpr existing-vector))))
+          z/root-string)
+      (-> entry
+          (z/append-child* (n/spaces 1))
+          (z/append-child* (n/keyword-node :refer))
+          (z/append-child* (n/spaces 1))
+          (z/append-child* (symbols-vector-node (combined [])))
+          z/root-string))))
+
+(defn- require-target-from-source [text target-ns refers]
+  (if (empty? refers)
+    text
+    (let [specs (header/libspec-entries (ns-form-source text))
+          existing (some #(when (= target-ns (str (:namespace %))) %) (:entries specs))]
+      (if existing
+        (add-refers-to-existing-libspec text target-ns refers)
+        (let [aliases (:aliases (header/source-aliases (ns-form-source text)))]
+          (require-ops/insert-into-require-sorted
+            text (symbol target-ns) (header/allocate-alias target-ns aliases) refers))))))
+
+;; ============================================================
+;; Checks
+;; ============================================================
+
+(defn- token-matches [text pattern]
+  (loop [loc (z/of-string text) found []]
+    (cond
+      (z/end? loc) found
+      (= :token (n/tag (z/node loc)))
+      (recur (z/next loc) (if-let [m (re-matches pattern (z/string loc))]
+                            (conj found m)
+                            found))
+      :else (recur (z/next loc) found))))
+
+(defn- forward-uses
+  "For forms in order, the names each one uses that are defined later."
+  [ordered-names deps]
+  (let [position (zipmap ordered-names (range))]
+    (->> ordered-names
+         (keep (fn [form-name]
+                 (let [later (->> (get deps form-name)
+                                  (filter #(when-let [p (position %)]
+                                             (> p (position form-name))))
+                                  (sort-by position)
+                                  vec)]
+                   (when (seq later) [form-name later]))))
+         vec)))
+
+(defn- refusal [error-type error & {:as data}]
+  (merge {:ok false
+          :error-type error-type
+          :error error
+          :source-unchanged true
+          :target-unchanged true}
+         data))
+
+;; ============================================================
+;; The complete move
+;; ============================================================
+
+(defn compile-move
+  "Plan moving `forms` from `source` into the existing `target` at `anchor`.
+  Pure: returns the complete future texts of both files, or a refusal.
+
+  Options: :source-file :source :target-file :target :target-ns :forms
+  :anchor {:above|:below FORM, :at-start|:at-end true} :project-aliases
+  :workspace-sources {path text}, and optional :public-forms."
+  [{:keys [source-file source target-file target target-ns forms anchor
+           project-aliases workspace-sources]
+    :or {project-aliases {} workspace-sources {}}
+    :as opts}]
+  (let [anchor-check (resolve-anchor target anchor project-aliases)
+        plan (when (:ok anchor-check)
+               (extract/compile-plan
+                 {:file source-file
+                  :source source
+                  :forms forms
+                  :to target-file
+                  :target-ns target-ns
+                  :workspace-sources workspace-sources
+                  :require-policy :copy-all
+                  :public-forms (vec (:public-forms opts))
+                  :derive-required-public-forms (not (contains? opts :public-forms))}))
+        moved (set (map str forms))
+        source-ns (some-> (ns-zloc source) z/down z/right z/string)
+        source-zloc (analyze/string->zloc source)
+        source-deps (into {} (map (juxt :name :depends-on))
+                          (analyze/intra-ns-deps source-zloc))
+        target-definitions (into #{} (comp (filter #(defining? project-aliases %))
+                                           (map :name))
+                                 (top-level-forms target))]
+    (cond
+      (not (:ok anchor-check)) (merge anchor-check {:source-unchanged true
+                                                    :target-unchanged true})
+      (:error plan) (assoc plan :source-unchanged true :target-unchanged true)
+
+      (seq (:missing-required-public-forms plan))
+      (refusal :required-public-forms-missing
+               "Every moved private form called by remaining source must be public"
+               :required-public-forms (:required-public-forms plan)
+               :missing-public-forms (:missing-required-public-forms plan))
+
+      (seq (set/intersection moved target-definitions))
+      (refusal :name-clash "The target already defines a moved name"
+               :names (vec (sort (set/intersection moved target-definitions))))
+
+      :else
+      (let [left-behind (->> (sort-by :line (:_form-texts plan))
+                             (keep (fn [{form-name :name}]
+                                     (let [calls (->> (get source-deps form-name)
+                                                      (remove moved)
+                                                      sort vec)]
+                                       (when (seq calls) {:form form-name :calls calls}))))
+                             vec)
+            target-alias-for-source (->> (:entries (header/libspec-entries
+                                                     (ns-form-source target)))
+                                         (keep #(when (= source-ns (str (:namespace %)))
+                                                  (some-> % :alias str)))
+                                         set)
+            target-references (->> (token-matches target #"(?:#')?([^:/][^/]*)/(.+)")
+                                   (filter (fn [[_ prefix local]]
+                                             (and (or (= prefix source-ns)
+                                                      (contains? target-alias-for-source prefix))
+                                                  (contains? moved local))))
+                                   (mapv first))]
+        (cond
+          (seq left-behind)
+          (refusal :left-behind-dependencies
+                   "A moved form calls a form that stays in the source"
+                   :left-behind left-behind
+                   :suggested-forms (->> (:_form-texts plan)
+                                         (mapcat #(map :name (:forms (analyze/extraction-closure
+                                                                       source-zloc (:name %)))))
+                                         (concat moved (mapcat :calls left-behind))
+                                         distinct sort vec)
+                   :next-step "Move the suggested forms together, or keep the moved form in the source")
+
+          (seq target-references)
+          (refusal :target-references-moved-form
+                   "The target calls a moved form through the source namespace"
+                   :references (vec (distinct target-references))
+                   :next-step "Rewrite those references first; caller rewriting is not built yet")
+
+          :else
+          (let [ordered (vec (sort-by :line (:_form-texts plan)))
+                public (set (:public-forms plan))
+                texts (mapv #(if (contains? public (:name %))
+                               (extract/publicize-defn-source (:text %))
+                               (:text %))
+                            ordered)
+                merged (merge-requires {:source-ns-form (ns-form-source source)
+                                        :target target
+                                        :target-ns target-ns
+                                        :form-sources texts})]
+            (if-not (:ok merged)
+              (assoc merged :source-unchanged true :target-unchanged true)
+              (let [source-context (namespace-context source project-aliases [])
+                    target-context (namespace-context (:target merged) project-aliases moved)
+                    changes (->> (header/form-free-symbols texts)
+                                 (remove #(str/includes? % "/"))
+                                 (remove moved)
+                                 sort
+                                 (keep (fn [sym]
+                                         (let [before (resolve-symbol source-context sym)
+                                               after (resolve-symbol target-context sym)
+                                               before (if (= before (str target-ns "/" sym))
+                                                        after
+                                                        before)]
+                                           (when (not= before after)
+                                             {:symbol sym
+                                              :in-source (or before "unresolved")
+                                              :in-target (or after "unresolved")}))))
+                                 vec)]
+                (if (seq changes)
+                  (refusal :meaning-change
+                           "A moved form would mean something different in the target"
+                           :changes changes)
+                  (let [names (mapv :name ordered)
+                        moved-deps (into {} (for [form-name names]
+                                              [form-name (set/intersection
+                                                           (get source-deps form-name #{})
+                                                           moved)]))
+                        declared (vec (distinct (mapcat second (forward-uses names moved-deps))))
+                        block (str/join "\n\n"
+                                        (cond->> (:form-sources merged)
+                                          (seq declared)
+                                          (cons (str "(declare " (str/join " " declared) ")"))))
+                        placed (place-block (:target merged) anchor project-aliases block)
+                        target' (:target placed)
+                        source' (-> (extract/source-without-forms source ordered)
+                                    (require-target-from-source
+                                      target-ns (:_source-referred-forms plan)))
+                        graph (into {}
+                                    (map (fn [text]
+                                           [(some-> (ns-zloc text) z/down z/right z/string)
+                                            (required-namespaces text)]))
+                                    (concat (vals (dissoc workspace-sources source-file target-file))
+                                            [source' target']))
+                        cycle (or (find-cycle graph source-ns) (find-cycle graph target-ns))
+                        target-order (mapv :name (filter #(defining? project-aliases %)
+                                                         (top-level-forms target')))
+                        target-deps (into {} (for [[form-name text] (map vector names (:form-sources merged))]
+                                               [form-name (set (filter target-definitions
+                                                                       (header/form-free-symbols [text])))]))
+                        late-uses (forward-uses target-order target-deps)
+                        auto-keywords (->> texts
+                                           (mapcat #(token-matches % #"::[^/]+"))
+                                           distinct sort vec)
+                        warnings (cond-> []
+                                   (seq auto-keywords)
+                                   (conj {:type :auto-resolved-keywords-moved
+                                          :keywords auto-keywords
+                                          :meaning (str "These now name the target namespace instead of "
+                                                        source-ns)})
+                                   (seq late-uses)
+                                   (into (for [[form-name uses] late-uses]
+                                           {:type :used-before-definition
+                                            :form form-name
+                                            :uses uses})))]
+                    (cond
+                      (not (:ok placed)) (assoc placed :source-unchanged true :target-unchanged true)
+
+                      cycle
+                      (refusal :circular-require
+                               "The move would make namespaces require each other"
+                               :cycle cycle)
+
+                      :else
+                      (do
+                        (parser/parse-string-all source')
+                        (parser/parse-string-all target')
+                        {:ok true
+                         :source source'
+                         :target target'
+                         :moved-forms names
+                         :public-forms (:public-forms plan)
+                         :declared declared
+                         :requires-added (:requires-added merged)
+                         :qualifiers-rewritten (:qualifiers-rewritten merged)
+                         :source-referred-forms (:_source-referred-forms plan)
+                         :warnings warnings
+                         :callers-to-review (:callers-to-review plan)
+                         :quoted-var-references (:quoted-var-references plan)}))))))))))))
