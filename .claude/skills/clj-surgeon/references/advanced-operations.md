@@ -44,6 +44,36 @@ and side-effect requires survive. Compile and test that conservative move;
 remove excess requirements in a later change. Do not hand-assemble a new
 namespace header when `:copy-all` can preserve it exactly.
 
+### Moving into an existing namespace
+
+When the target namespace file already exists, add `--into-existing` and name
+exactly one anchor: `--above FORM`, `--below FORM`, `--at-start` (after the
+`ns` form) or `--at-end`. Several forms keep their source order as one block.
+Preview first; the preview writes nothing:
+
+```bash
+clj-surgeon extract --file src/billing/invoice.clj --forms '[has-email?]' \
+  --to src/billing/customer.clj --into-existing --below email
+clj-surgeon extract! --file src/billing/invoice.clj --forms '[has-email?]' \
+  --to src/billing/customer.clj --into-existing --below email \
+  --receipt-out /tmp/move.edn
+clj-surgeon undo-extract! --receipt /tmp/move.edn
+```
+
+The move adds missing target requires at their sorted positions, rewrites the
+moved forms' qualifiers to the target's aliases (`customer/email` becomes
+`email` inside `billing.customer`), makes moved private forms that the source
+still calls public, and adds a `:refer` for them to the source. It refuses
+before any write on: an anchor the definition list does not know (the refusal
+shows the `.clj-surgeon.edn` `:aliases` entry for an unrecognized macro), an
+ambiguous anchor (use a typed one such as `'defmethod render :card'`), a name
+the target already defines, a plain symbol that would mean something else in
+the target, a moved form that calls one left behind (move the suggested set
+together), an alias conflict, or a circular require. A new clj-kondo error
+after the write restores both files. Warnings name moved unqualified `::`
+keywords and moved forms placed above a target form they call. Callers in
+other files are reported, not rewritten.
+
 The dry run also reports authority-labeled `quoted-var-references` for exact
 `#'name` and `(var name)` callers that semantic indexes can omit. Review all
 caller evidence before applying. Execution parses and hash-verifies both future

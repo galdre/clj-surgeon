@@ -10,6 +10,19 @@ is cut.
 
 ### Added
 
+- `extract`/`extract!` move forms into a namespace file that already exists
+  with `--into-existing` and exactly one of `--above FORM`, `--below FORM`,
+  `--at-start` or `--at-end`. The plan merges requires at their sorted
+  positions, rewrites the moved forms' qualifiers to the target's aliases
+  (calls into the target become plain names), makes moved private forms the
+  source still calls public, and adds a `:refer` to the source. It refuses
+  unknown or ambiguous anchors, name clashes, symbols whose meaning would
+  change, forms left behind that a moved form calls, alias conflicts and
+  circular requires before writing. A new clj-kondo error after the write
+  restores both files; `undo-extract!` restores both from the receipt.
+  Callers in other files are reported, not yet rewritten.
+  Plan: `docs/plans/move-into-existing-namespace.md`.
+
 - The CLI accepts GNU-style arguments: `clj-surgeon ls --file src/a.clj`,
   `--key=value`, and a bare `--flag` for `true`. The original
   `:op :ls :file src/a.clj` style keeps working unchanged, and the two can

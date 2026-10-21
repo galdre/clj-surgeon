@@ -1,6 +1,6 @@
 # Move Forms Into an Existing Namespace
 
-**Status:** Planned 2026-10-21. Decisions answered by galdre on the decision page
+**Status:** Stages 1 and 2 built 2026-10-21 on branch `fix/cli-extract-public-forms`; stages 3 and 4 open. Decisions answered by galdre on the decision page
 "Move Into Existing Namespace" (key `move-into-ns`).
 **Motivating evidence:** the invoice refactoring trial (2026-10-21). An agent
 building domain vocabulary namespaces needed to move helpers such as
