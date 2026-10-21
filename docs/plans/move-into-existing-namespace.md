@@ -33,7 +33,7 @@ name.
 |---|---|---|
 | 1 | Make a moved private form public when the source still calls it? | Yes, automatically, and report it in `:public-forms`. An explicit `:public-forms` list that omits one refuses. Done on this branch (439e590). |
 | 2 | How does a caller ask for an existing target? | An explicit flag on `extract!`, `--into-existing`. Without it an existing target still refuses. |
-| 3 | Where do the forms go? | An anchor is always required: `--above FORM` or `--below FORM`. Several forms keep their source order as one block at the anchor. If the result uses a form before its definition with no `declare`, the move still happens and the result carries a warning. How an anchor names a form, ambiguous names, and targets with no suitable anchor are open (see Open Questions). |
+| 3 | Where do the forms go? | An anchor is always required: `--above FORM` or `--below FORM`. Several forms keep their source order as one block at the anchor. If the result uses a form before its definition with no `declare`, the move still happens and the result carries a warning. Anchor details are under Anchors below. |
 | 4 | How are requires merged? | Add each missing libspec, inserted at its alphabetical position; existing entries are never reordered. For a library the target already requires under a different alias, rewrite the moved forms' qualifiers to the target's alias. Refuse only when the target uses the same alias for a different library. |
 | 5 | Calls into the target through an alias? | Rewrite to plain names (`customer/email` to `email`, `::customer/k` to `::k`) and add no require of the target to itself. |
 | 6 | A form that would mean something different in the target? | Refuse a defined-name clash and a plain symbol that resolves differently in the target, naming each. An unqualified auto-resolved keyword (`::id`) moves unchanged and the result carries a warning listing each one; the caller renames them as it sees fit. An aliased keyword (`::inv/id`) is treated like an aliased symbol (decisions 4 and 5). |
@@ -51,18 +51,19 @@ name.
   codebase inconsistent. Detecting a refusal before writing is the goal;
   rolling every file back is the fallback when that is not possible.
 
-### Open Questions
+### Anchors (answered 2026-10-21, decision page "Move Anchor Decisions")
 
-Anchors (3) need decisions of their own:
-
-- How an anchor names a form. Today `:mv` resolves only recognized defining
-  forms (core forms, `>defn`, and macros declared in `.clj-surgeon.edn`); the
-  outline names other forms heuristically, so `(defwhatever foo ...)` is
-  `foo` in `:ls` but "not found" for `:mv --before foo`.
-- What happens when a name matches several forms (a `defmulti` and its
-  `defmethod`s share one name).
-- What anchor a move uses when the target has no suitable form: only an `ns`
-  form, or only unnamed forms such as `(comment ...)`.
+- **Named anchors** name only forms in clj-surgeon's definition list: core
+  defining forms, the `>defn` macros, and macros declared in the project's
+  `.clj-surgeon.edn`. An unrecognized macro, such as `(defwhatever foo ...)`,
+  refuses; the refusal shows the `.clj-surgeon.edn` entry that would make it
+  recognized, and the `--at-start` / `--at-end` alternatives.
+- **Ambiguous names** refuse and list every match. The caller names one
+  exactly with a typed anchor, such as `--below 'defmethod render :card'`.
+- **No nameable form:** `--at-start` (directly after the `ns` form) and
+  `--at-end` (after the last form). There are no line-number anchors; forms
+  with no usable name, such as `(comment ...)`, cannot be anchors.
+- Exactly one of `--above`, `--below`, `--at-start`, `--at-end` is required.
 
 ## Public Contract
 
@@ -89,7 +90,9 @@ definition; moved unqualified `::` keywords), `:lint`, and the receipt path. Eve
 |---|---|
 | `:extraction-target-exists` | target exists and `--into-existing` is absent (unchanged behaviour) |
 | `:into-existing-target-missing` | `--into-existing` and the target does not exist |
-| `:anchor-required` / `:anchor-not-found` / `:ambiguous-anchor` | no anchor, both anchors, an anchor the target does not define, or one that matches several forms (details open) |
+| `:anchor-required` | none, or more than one, of `--above`, `--below`, `--at-start`, `--at-end` |
+| `:anchor-not-found` | the anchor names no form in the definition list; shows the `.clj-surgeon.edn` entry for an unrecognized macro |
+| `:ambiguous-anchor` | the anchor's name matches several forms; lists each with a typed anchor that names it exactly |
 | `:required-public-forms-missing` | an explicit `:public-forms` omits a required form |
 | `:alias-conflict` | target uses a moved form's alias for a different library |
 | `:name-clash` | target already defines a moved name |
@@ -117,7 +120,7 @@ definition; moved unqualified `::` keywords), `:lint`, and the receipt path. Eve
 | Dimension | Cases |
 |---|---|
 | Flag and target | no flag + existing target refuses; flag + missing target refuses; flag + existing target moves |
-| Anchor | above, below, missing, both, unknown name, anchor at start and end of file |
+| Anchor | above; below; at-start; at-end; none; two given; unknown name; unrecognized custom macro (refusal shows the `.clj-surgeon.edn` entry); macro declared in `.clj-surgeon.edn`; ambiguous `defmulti`/`defmethod` name; typed `defmethod` anchor; target with only an `ns` form |
 | Order | one form; several in source order; result uses a form before its definition (warning, still moves) |
 | Requires | already present same alias; missing (sorted insert, first, middle, last); same library other alias (qualifiers rewritten); same alias other library (refuse); target has no `:require` clause |
 | Self references | `alias/f` to the target becomes `f`; `::alias/k` becomes `::k`; no self-require added |
