@@ -8,7 +8,24 @@ is cut.
 
 ## [Unreleased]
 
+### Added
+
+- The CLI accepts GNU-style arguments: `clj-surgeon ls --file src/a.clj`,
+  `--key=value`, and a bare `--flag` for `true`. The original
+  `:op :ls :file src/a.clj` style keeps working unchanged, and the two can
+  be mixed. A keyword-style key still takes its next argument verbatim, so
+  values that start with `--` behave as before.
+
+- `:extract` and `:extract!` accept `:public-forms`, an EDN vector of moved
+  private forms to make public.
+
 ### Fixed
+
+- CLI `:extract!` no longer writes a moved `defn-` that the source still
+  calls. Without `:public-forms` it now makes every such form public, as the
+  MCP route already did; an explicit `:public-forms` list that omits one
+  refuses with `:required-public-forms-missing` and leaves both files
+  unchanged. The success result reports `:public-forms`.
 
 - Receipt and refusal wording no longer contradicts its own numbers: a
   one-arm multimethod says "1 defmethod arm shares", a basis whose pattern

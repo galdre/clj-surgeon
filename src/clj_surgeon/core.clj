@@ -1058,7 +1058,8 @@
                               (contains? hidden-from-primary-help op-key)))
                     (group-by (fn [[_ v]] (:category v))))]
     (.append sb "clj-surgeon — structural operations on Clojure namespaces\n\n")
-    (.append sb "Usage: clj-surgeon :op <command> [args...]\n")
+    (.append sb "Usage: clj-surgeon <command> [--arg value | --arg=value | --flag ...]\n")
+    (.append sb "       clj-surgeon :op <command> [:arg value ...]   original style; still accepted\n")
     (.append sb "       clj-surgeon up [WORKSPACE]      join the shared hot MCP stack\n")
     (.append sb "       clj-surgeon recover [WORKSPACE] repair once; receipt names fallback\n")
     (.append sb "       clj-surgeon report-failure --receipt PATH\n")
@@ -1295,13 +1296,62 @@
     (.startsWith s "{") (read-string s)  ;; parse EDN maps
     :else s))
 
+(defn- gnu-flag? [s]
+  (and (string? s) (str/starts-with? s "--") (> (count s) 2)))
+
+(defn normalize-args
+  "Rewrite GNU-style CLI arguments into the original keyword style, so both
+  are accepted. Pure: string sequence in, string vector out.
+
+  - `--key value` and `--key=value` become `:key value`.
+  - A `--key` followed by nothing or by another `--key` becomes `:key true`.
+  - A leading word with no `:` or `-` prefix is the operation: `ls ...`
+    becomes `:op :ls ...`. A `--op` value without `:` is made a keyword too.
+  - Keyword-style arguments pass through unchanged, so the styles can mix.
+    A keyword-style key takes the next argument verbatim, even one that
+    starts with `--`. In GNU style, write such a value as `--key=--value`."
+  [args]
+  (let [args (vec args)
+        args (if (and (seq args)
+                      (not (str/starts-with? (first args) ":"))
+                      (not (str/starts-with? (first args) "-")))
+               (into [":op" (str ":" (first args))] (rest args))
+               args)
+        op-value (fn [k v]
+                   (if (and (= ":op" k) (not (str/starts-with? v ":")))
+                     (str ":" v)
+                     v))]
+    (loop [[arg & more] args
+           out []]
+      (cond
+        (nil? arg) out
+
+        (and (gnu-flag? arg) (str/includes? arg "="))
+        (let [[k v] (str/split (subs arg 2) #"=" 2)
+              k (str ":" k)]
+          (recur more (conj out k (op-value k v))))
+
+        (gnu-flag? arg)
+        (let [k (str ":" (subs arg 2))
+              [next-arg & after] more]
+          (if (or (nil? next-arg) (gnu-flag? next-arg))
+            (recur more (conj out k "true"))
+            (recur after (conj out k (op-value k next-arg)))))
+
+        ;; A keyword-style key takes the next argument verbatim as its value.
+        (and (str/starts-with? arg ":") (seq more))
+        (recur (rest more) (conj out arg (first more)))
+
+        :else (recur more (conj out arg))))))
+
 (defn parse-args
-  "Parse CLI arg strings into an opts map.
+  "Parse CLI arg strings into an opts map. Accepts both `:key value` and
+   GNU-style `--key value` arguments (see normalize-args).
    Pure: string sequence in, map out."
   [args]
   (let [help-flags #{"--help" "-h"}
         has-help?  (some help-flags args)
-        kv-args    (remove help-flags args)]
+        kv-args    (normalize-args (remove help-flags args))]
     (when (odd? (count kv-args))
       (throw (ex-info "Arguments must be key-value pairs"
                       {:error-type :invalid-arguments})))
