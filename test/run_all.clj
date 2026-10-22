@@ -37,6 +37,7 @@
    [clj-surgeon.partition-all-test]
    [clj-surgeon.platform-selector-test]
    [clj-surgeon.quoted-var-refs-test]
+   [clj-surgeon.receipt-mac-test]
    [clj-surgeon.recovery-test]
    [clj-surgeon.rename-test]
    [clj-surgeon.show-form-test]
@@ -57,6 +58,7 @@
                    'clj-surgeon.move-dependency-test
                    'clj-surgeon.move-into-test
                    'clj-surgeon.move-callers-test
+                   'clj-surgeon.receipt-mac-test
                    'clj-surgeon.move-into-shell-test
                    'clj-surgeon.analyze-test
                    'clj-surgeon.diagnostic-delta-test

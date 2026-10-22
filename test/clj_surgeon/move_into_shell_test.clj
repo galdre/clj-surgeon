@@ -6,6 +6,7 @@
    [babashka.fs :as fs]
    [clj-surgeon.lint-gate :as lint-gate]
    [clj-surgeon.move-into-shell :as shell]
+   [clj-surgeon.structural-lens :as structural-lens]
    [clojure.java.io :as io]
    [clojure.string :as str]
    [clojure.test :refer [deftest is testing]]))
@@ -163,7 +164,7 @@
         lint (fn [files] (swap! linted conj (set (map #(.getName (io/file (str %))) files)))
                {:checked true :findings []})]
     (try
-      (let [result (shell/execute! (opts root :lint lint))]
+      (let [result (shell/execute! (opts root :lint lint :callers "accept-proposed"))]
         (is (:applied result))
         (is (str/includes? (slurp test-file) "(#'billing.customer/has-email? {:email \"a@b\"})"))
         (is (str/includes? (slurp test-file) "   [billing.customer]\n   [billing.invoice]\n"))
@@ -187,7 +188,7 @@
         receipt (io/file root "move.edn")
         before (mapv slurp files)]
     (try
-      (is (:applied (shell/execute! (opts root :receipt-out (str receipt)))))
+      (is (:applied (shell/execute! (opts root :receipt-out (str receipt) :callers "accept-proposed"))))
       (is (every? true? (map not= before (map slurp files))))
       (is (:restored (shell/undo! {:receipt (str receipt)})))
       (is (= before (mapv slurp files)))
@@ -201,7 +202,7 @@
     (try
       (let [planned (shell/plan (opts root))
             _ (spit test-file (str (slurp test-file) "\n;; edited\n"))
-            result (shell/apply-plan! (opts root) planned)]
+            result (shell/apply-plan! (opts root :callers "accept-proposed") planned)]
         (is (= :stale-source (:error-type result)))
         (is (= ["test/billing/invoice_test.clj"] (:changed result)))
         (is (= customer-before (slurp customer))))
@@ -233,7 +234,7 @@
           files (mapv #(io/file root %) ["src/billing/customer.clj" "src/billing/invoice.clj"
                                          "test/billing/invoice_test.clj"])]
       (try
-        (let [result (shell/execute! (dissoc (opts root) :lint))]
+        (let [result (shell/execute! (dissoc (opts root :callers "accept-proposed") :lint))]
           (is (:applied result))
           (is (= {:checked true :files 3 :new-errors 0} (:lint result)))
           (is (= [] (->> (:findings (lint-gate/clj-kondo-lint files))
@@ -274,3 +275,139 @@
                (mapv #(select-keys % [:type :message])
                      (lint-gate/new-blocking-findings [] (:findings (lint-gate/clj-kondo-lint [a b]))))))
         (finally (delete-recursive! root))))))
+
+;; The model chooses caller semantics; the tool owns the mechanics
+;; (docs/high-level-design.md). A move with callers elsewhere proposes their
+;; exact rewrites and writes nothing until the request accepts them.
+(deftest callers-are-proposed-and-written-only-when-accepted
+  (let [root (invoice-project-with-test!)
+        files (mapv #(io/file root %) ["src/billing/customer.clj" "src/billing/invoice.clj"
+                                       "test/billing/invoice_test.clj"])
+        before (mapv slurp files)]
+    (try
+      (testing "without a decision the move refuses with the proposal and writes nothing"
+        (let [r (shell/execute! (opts root))]
+          (is (= :extraction-decisions-required (:error-type r)))
+          (is (= [{:file "test/billing/invoice_test.clj" :rewritten 1
+                   :requires-added ["billing.customer"] :requires-removed []}]
+                 (:callers-proposed r)))
+          (is (str/includes? (:next-step r) "--callers accept-proposed"))
+          (is (:files-unchanged r))
+          (is (= before (mapv slurp files)))))
+      (testing "an unknown decision refuses"
+        (is (= :invalid-callers-decision
+               (:error-type (shell/execute! (opts root :callers "rewrite-everything"))))))
+      (testing "accepting the proposal writes the move and the callers"
+        (let [r (shell/execute! (opts root :callers "accept-proposed"))]
+          (is (:applied r))
+          (is (= 3 (:files-written r)))))
+      (finally (delete-recursive! root)))))
+
+(deftest a-move-with-no-outside-callers-needs-no-decision
+  (let [root (invoice-project!)]
+    (try
+      (is (:applied (shell/execute! (opts root))))
+      (finally (delete-recursive! root)))))
+
+;; Fence review 2026-10-21 (F1): --receipt-out overwrote any file, the move's
+;; own target among them, after the move reported success.
+(deftest a-receipt-path-that-would-overwrite-a-file-refuses-before-the-move
+  (let [root (invoice-project!)
+        customer (io/file root "src" "billing" "customer.clj")
+        invoice (io/file root "src" "billing" "invoice.clj")
+        existing (doto (io/file root "old.edn") (spit "{}"))
+        before [(slurp customer) (slurp invoice)]]
+    (try
+      (doseq [[receipt error-type] [[(str customer) :extraction-receipt-alias]
+                                    [(str existing) :extraction-receipt-exists]
+                                    [(str (io/file root "move.txt")) :invalid-extraction-receipt-path]]]
+        (is (= error-type (:error-type (shell/execute! (opts root :receipt-out receipt)))) receipt)
+        (is (= before [(slurp customer) (slurp invoice)])))
+      (is (= "{}" (slurp existing)))
+      (finally (delete-recursive! root)))))
+
+;; Fence review 2026-10-21 (F11): an empty source root was accepted.
+(deftest an-empty-source-root-refuses
+  (let [root (invoice-project!)]
+    (try
+      (is (= :invalid-source-roots (:error-type (shell/execute! (opts root :source-roots [""])))))
+      (finally (delete-recursive! root)))))
+
+;; Fence review 2026-10-21 (F5): the CLI lint gate had no timeout, and a hung
+;; clj-kondo after the write left every file rewritten.
+(deftest a-post-write-lint-that-cannot-finish-restores-every-file
+  (let [root (invoice-project!)
+        files (mapv #(io/file root %) ["src/billing/customer.clj" "src/billing/invoice.clj"])
+        before (mapv slurp files)
+        calls (atom 0)
+        lint (fn [_] (if (= 1 (swap! calls inc))
+                       {:checked true :findings []}
+                       {:checked false :reason "clj-kondo timed out" :timed-out true}))]
+    (try
+      (let [r (shell/execute! (opts root :lint lint))]
+        (is (= :lint-unverified (:error-type r)))
+        (is (true? (:restored r)))
+        (is (= before (mapv slurp files))))
+      (finally (delete-recursive! root)))))
+
+(deftest the-lint-gate-times-out
+  (let [r (lint-gate/clj-kondo-lint [] {:command ["sleep" "5"] :timeout-ms 200})]
+    (is (false? (:checked r)))
+    (is (true? (:timed-out r)))))
+
+;; Fence review 2026-10-21 (F8): undo-extract! wrote whatever paths an
+;; unauthenticated receipt named.
+(deftest undo-restores-only-receipts-this-machine-signed
+  (let [root (invoice-project!)
+        victim (doto (io/file root "victim.txt") (spit "keep me"))
+        receipt (io/file root "move.edn")]
+    (try
+      (testing "a hand-made receipt refuses"
+        (spit (io/file root "forged.edn")
+              (pr-str {:kind :move-into
+                       :files [{:path (str victim) :original "owned"
+                                :result-hash (structural-lens/source-hash "keep me")}]}))
+        (is (= :receipt-not-authentic (:error-type (shell/undo! {:receipt (str (io/file root "forged.edn"))}))))
+        (is (= "keep me" (slurp victim))))
+      (testing "a signed receipt with a changed path refuses"
+        (is (:applied (shell/execute! (opts root :receipt-out (str receipt)))))
+        (spit receipt (str/replace (slurp receipt) (str (io/file root "src" "billing" "customer.clj")) (str victim)))
+        (is (= :receipt-not-authentic (:error-type (shell/undo! {:receipt (str receipt)}))))
+        (is (= "keep me" (slurp victim))))
+      (finally (delete-recursive! root)))))
+
+;; Fence review 2026-10-21 (F11): a --to that names the source through a
+;; symlink, and a symlink loop in the workspace, failed as :invalid-arguments.
+(deftest path-mistakes-refuse-with-their-own-labels
+  (let [root (invoice-project!)
+        link (io/file root "src" "billing" "same.clj")]
+    (try
+      (java.nio.file.Files/createSymbolicLink (.toPath link) (.toPath (io/file root "src" "billing" "invoice.clj"))
+                                              (make-array java.nio.file.attribute.FileAttribute 0))
+      (is (= :extraction-path-collision (:error-type (shell/plan (opts root :to (str link))))))
+      (.delete link)
+      (java.nio.file.Files/createSymbolicLink (.toPath (io/file root "src" "loop")) (.toPath (io/file root "src" "loop"))
+                                              (make-array java.nio.file.attribute.FileAttribute 0))
+      (testing "the walk skips a symlink loop instead of failing"
+        (is (:ok (shell/plan (opts root)))))
+      (finally (delete-recursive! root)))))
+
+(deftest the-lint-gate-runs-in-the-given-directory
+  (let [dir (.getCanonicalPath (.toFile (java.nio.file.Files/createTempDirectory "lint-dir" (make-array java.nio.file.attribute.FileAttribute 0))))
+        r (lint-gate/clj-kondo-lint [] {:command ["sh" "-c" "printf '{:findings [{:message \"%s\"}]}' \"$(pwd -P)\""]
+                                        :dir dir})]
+    (is (= [dir] (mapv :message (:findings r))))))
+
+;; Fence re-review 2026-10-22 (N1): a requested source root that does not
+;; exist, or leaves the workspace through a symlink, was dropped silently;
+;; the scan found no callers and the move left one dangling.
+(deftest a-requested-source-root-that-is-missing-or-outside-refuses
+  (let [root (invoice-project-with-test!)
+        outside (.toFile (java.nio.file.Files/createTempDirectory "outside-root" (make-array java.nio.file.attribute.FileAttribute 0)))]
+    (try
+      (java.nio.file.Files/createSymbolicLink (.toPath (io/file root "linkout")) (.toPath outside)
+                                              (make-array java.nio.file.attribute.FileAttribute 0))
+      (doseq [roots [["nope"] ["src" "linkout"]]]
+        (let [r (shell/plan (opts root :source-roots roots))]
+          (is (= :invalid-source-roots (:error-type r)) (pr-str roots))))
+      (finally (delete-recursive! root) (delete-recursive! outside)))))

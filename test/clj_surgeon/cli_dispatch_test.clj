@@ -359,7 +359,8 @@
       (testing "help documents the flags"
         (let [{:keys [out]} (run-cli "extract!" "--help")]
           (is (str/includes? out "into-existing"))
-          (is (str/includes? out "source-roots"))))
+          (is (str/includes? out "source-roots"))
+          (is (str/includes? out "accept-proposed"))))
       (testing "a refusal is EDN with a nonzero exit and leaves every file unchanged"
         (let [before (slurp (path "test/billing/invoice_test.clj"))
               {:keys [exit out]} (apply run-cli "extract!" (concat move-args ["--below" "nope"]))]
@@ -371,8 +372,15 @@
               result (edn/read-string out)]
           (is (zero? exit))
           (is (= ["test/billing/invoice_test.clj"] (:callers-to-review result)))))
-      (testing "the apply rewrites the caller"
-        (let [{:keys [exit out err]} (apply run-cli "extract!" (concat move-args ["--below" "email"]))
+      (testing "without a decision the apply refuses with the proposal"
+        (let [before (slurp (path "test/billing/invoice_test.clj"))
+              {:keys [exit out]} (apply run-cli "extract!" (concat move-args ["--below" "email"]))]
+          (is (pos? exit))
+          (is (= :extraction-decisions-required (:error-type (edn/read-string out))))
+          (is (= before (slurp (path "test/billing/invoice_test.clj"))))))
+      (testing "the apply rewrites the caller once accepted"
+        (let [{:keys [exit out err]} (apply run-cli "extract!" (concat move-args ["--below" "email"
+                                                                                  "--callers" "accept-proposed"]))
               result (edn/read-string out)]
           (is (zero? exit) err)
           (is (:applied result))
@@ -396,11 +404,28 @@
           (is (= ["test/billing/invoice_test.clj"] (:callers-to-review result)))
           (is (empty? (filter #(str/starts-with? (name %) "_") (keys result))))
           (is (< (count out) 4096))))
-      (testing "the apply rewrites the caller"
-        (let [{:keys [exit out err]} (apply run-cli "extract!" extract-args)
+      (testing "the apply rewrites the caller once accepted"
+        (let [{:keys [exit out err]} (apply run-cli "extract!" (concat extract-args ["--callers" "accept-proposed"]))
               result (edn/read-string out)]
           (is (zero? exit) err)
           (is (= 3 (:files-written result)))
           (is (str/includes? (slurp (path "test/billing/invoice_test.clj"))
                              "#'billing.contact/has-email?"))))
       (finally (delete-tree! root)))))
+
+;; Fence review 2026-10-21 (F9 and F10): CLI values and a repository's deps.edn were read with
+;; clojure.core/read-string, which evaluates #=(...).
+(deftest cli-values-and-build-files-are-read-without-evaluation
+  (let [dir (doto (java.io.File/createTempFile "clj-surgeon-read-eval" "") .delete .mkdirs)
+        marker (io/file dir "PWNED")
+        payload (str "#=(clojure.core/spit \"" (.getPath marker) "\" \"x\")")]
+    (try
+      (testing "a CLI EDN value"
+        (is (thrown? Exception (core/parse-val (str "[" payload "]"))))
+        (is (not (.exists marker))))
+      (testing "a deps.edn read for source paths"
+        (let [deps (io/file dir "deps.edn")]
+          (spit deps (str "{:paths [" payload "]}"))
+          (is (= ["src"] (#'core/extract-source-paths (.getPath deps))))
+          (is (not (.exists marker)))))
+      (finally (delete-tree! dir)))))

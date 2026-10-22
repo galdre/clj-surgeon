@@ -512,10 +512,17 @@
 
   Options: :source-file :source :target-file :target :target-ns :forms
   :anchor {:above|:below FORM, :at-start|:at-end true} :project-aliases
-  :workspace-sources {path text}, and optional :public-forms."
+  :workspace-sources {path text}, and optional :public-forms.
+
+  :caller-authority :kernel (the default) refuses on any caller reference
+  it cannot rewrite and counts the proposed caller rewrites in the require
+  graph. :model, for a request whose model decides its callers itself,
+  returns the proposal and its unrewritable references as evidence
+  (:callers, :caller-problems) and keeps them out of the refusals and the
+  graph. :max-candidates bounds the caller scan."
   [{:keys [source-file source target-file target target-ns forms anchor
-           project-aliases workspace-sources]
-    :or {project-aliases {} workspace-sources {}}
+           project-aliases workspace-sources caller-authority max-candidates]
+    :or {project-aliases {} workspace-sources {} caller-authority :kernel}
     :as opts}]
   (let [anchor-check (resolve-anchor target anchor project-aliases)
         plan (when (:ok anchor-check)
@@ -595,16 +602,22 @@
             ;; spells only its last segment.
             rewrite-callers (fn []
                               (let [target-self (rewrite target-file target :target)
-                                    {:keys [callers problems]}
+                                    {:keys [callers problems budget-exceeded]}
                                     (move-callers/rewrite-callers
                                       {:sources workspace-sources :exclude [source-file target-file]
                                        :source-ns source-ns :target-ns target-ns :target-file target-file
-                                       :moved moved-vars :moved-classes moved-classes})]
+                                       :moved moved-vars :moved-classes moved-classes
+                                       :max-candidates max-candidates})
+                                    kernel? (= :kernel caller-authority)]
                                 {:target-self target-self
-                                 :unrewritable (into (vec (:problems target-self)) problems)
+                                 :budget-exceeded budget-exceeded
+                                 :unrewritable (cond-> (vec (:problems target-self))
+                                                 kernel? (into problems))
+                                 :caller-problems (if kernel? [] (vec problems))
                                  :callers callers}))
-            {:keys [target-self unrewritable callers]} (when (empty? left-behind)
-                                                         (rewrite-callers))]
+            {:keys [target-self unrewritable callers caller-problems budget-exceeded]}
+            (when (empty? left-behind)
+              (rewrite-callers))]
         (cond
           (seq left-behind)
           (refusal :left-behind-dependencies
@@ -616,6 +629,9 @@
                                          (concat moved (map #(owner-of % %) (mapcat :calls left-behind)))
                                          distinct sort vec)
                    :next-step "Move the suggested forms together, or keep the moved form in the source")
+
+          budget-exceeded
+          (merge (move-callers/budget-refusal budget-exceeded) {:target-unchanged true})
 
           (seq unrewritable)
           (refusal :caller-not-rewritable
@@ -686,7 +702,8 @@
                         graph (into {}
                                     (keep move-callers/ns-requires)
                                     (concat (vals (merge (dissoc workspace-sources source-file target-file)
-                                                    (into {} (map (juxt :file :text)) callers)))
+                                                    (when (= :kernel caller-authority)
+                                                      (into {} (map (juxt :file :text)) callers))))
                                             [source' target']))
                         cycle (or (move-callers/find-cycle graph source-ns)
                                   (move-callers/find-cycle graph target-ns))
@@ -737,5 +754,7 @@
                          :source-referred-forms source-referred
                          :warnings warnings
                          :callers (into {} (map (juxt :file :text)) callers)
+                         :caller-problems caller-problems
+                         :block block
                          :callers-rewritten (move-callers/caller-summary callers)
                          :callers-to-review (mapv :file callers)}))))))))))))

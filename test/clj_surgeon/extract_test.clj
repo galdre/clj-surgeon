@@ -947,7 +947,7 @@
                                             "(#'app.fresh/f)\n")}
            (:_callers r)))
     (is (= ["src/app/use.clj" "test/app/source_test.clj"] (:callers-to-review r)))
-    (is (= [1 1] (mapv :rewritten (:callers-rewritten r))))
+    (is (= [1 1] (mapv :rewritten (:callers-proposed r))))
     (testing "a caller that cannot be rewritten refuses"
       (let [r (extract/with-caller-rewrites
                 plan (assoc sources "dev/user.clj" "(ns user)\n\n(defn go [] (require 'app.source) ((resolve 'app.source/f)))\n"))]
@@ -988,7 +988,8 @@
                                       :forms '[distill refine]
                                       :to (.getPath target)
                                       :receipt-out (.getPath receipt)
-                                      :lint (fn [_] {:checked false})})]
+                                      :lint (fn [_] {:checked false})
+                                      :callers "accept-proposed"})]
         (is (str/includes? (slurp (nth files 1)) "[(distillery/distill 1) (app/helper 2)]"))
         (is (str/includes? (slurp (nth files 2)) "(#'my.distillery/refine \"x\")"))
         (is (= ["src/my/cli.clj" "test/my/app_test.clj"] (:callers-to-review result)))
@@ -1012,7 +1013,8 @@
                                                   (spit caller (str (slurp caller) ";; edited\n"))
                                                   p))]
                      (extract/execute! {:file (.getPath source) :forms '[distill refine]
-                                        :to (.getPath target) :lint (fn [_] {:checked false})}))]
+                                        :to (.getPath target) :lint (fn [_] {:checked false})
+                                        :callers "accept-proposed"}))]
         (is (= :stale-extraction-source (:error-type result)))
         (is (= ["src/my/cli.clj"] (:changed result)))
         (is (= before (slurp source)))
@@ -1031,7 +1033,8 @@
                                                   :level :warning :message "Unresolved var: x/y"}]}))]
     (try
       (let [result (extract/execute! {:file (.getPath (first files)) :forms '[distill refine]
-                                      :to (.getPath target) :lint lint})]
+                                      :to (.getPath target) :lint lint
+                                      :callers "accept-proposed"})]
         (is (= :lint-regression (:error-type result)))
         (is (true? (:restored result)))
         (is (= before (mapv slurp files)))
@@ -1045,5 +1048,81 @@
 (deftest the-mcp-server-classpath-loads-the-extraction-namespaces
   (let [{:keys [exit err]} (shell/sh "clojure" "-M" "-e"
                                      (str "(require 'clj-surgeon.extract 'clj-surgeon.lint-gate "
-                                          "'clj-surgeon.move-callers 'clj-surgeon.move-into)"))]
+                                          "'clj-surgeon.move-callers 'clj-surgeon.move-into "
+                                          "'clj-surgeon.receipt-mac)"))]
     (is (zero? exit) err)))
+
+;; The model chooses caller semantics (docs/high-level-design.md): callers in
+;; other files are proposed, and written only when the request accepts them.
+(deftest test-execute-refuses-proposed-callers-without-a-decision
+  (let [root (create-caller-project!)
+        files (mapv #(io/file root %) ["src/my/app.clj" "src/my/cli.clj" "test/my/app_test.clj"])
+        target (io/file root "src" "my" "distillery.clj")
+        before (mapv slurp files)]
+    (try
+      (let [result (extract/execute! {:file (.getPath (first files)) :forms '[distill refine]
+                                      :to (.getPath target) :lint (fn [_] {:checked false})})]
+        (is (= :extraction-decisions-required (:error-type result)))
+        (is (= ["src/my/cli.clj" "test/my/app_test.clj"] (mapv :file (:callers-proposed result))))
+        (is (str/includes? (:next-step result) "--callers accept-proposed"))
+        (is (= before (mapv slurp files)))
+        (is (not (.exists target))))
+      (finally (delete-recursive! root)))))
+
+;; Fence review 2026-10-21 (F6): new-file extraction did not validate
+;; --source-roots; ["/usr"] proved zero callers and left a caller dangling.
+(deftest test-plan-refuses-source-roots-outside-the-project
+  (let [root (create-caller-project!)]
+    (try
+      (doseq [bad [["/usr"] ["../elsewhere"] [""]]]
+        (is (= :invalid-source-roots
+               (:error-type (extract/plan {:file (str (io/file root "src/my/app.clj"))
+                                           :forms '[distill]
+                                           :to (str (io/file root "src/my/distillery.clj"))
+                                           :source-roots bad})))
+            (pr-str bad)))
+      (finally (delete-recursive! root)))))
+
+;; Fence review 2026-10-21 (F8): a tampered extraction receipt refuses before
+;; writing anything.
+(deftest test-undo-refuses-a-tampered-receipt
+  (let [root (create-caller-project!)
+        source (io/file root "src" "my" "app.clj")
+        target (io/file root "src" "my" "distillery.clj")
+        victim (doto (io/file root "victim.txt") (spit "keep me"))
+        receipt (io/file root "extract.edn")]
+    (try
+      (extract/execute! {:file (.getPath source) :forms '[distill refine] :to (.getPath target)
+                         :receipt-out (.getPath receipt) :lint (fn [_] {:checked false})
+                         :callers "accept-proposed"})
+      (let [cli (.getCanonicalPath (io/file root "src" "my" "cli.clj"))]
+        (spit receipt (str/replace (slurp receipt) cli (.getCanonicalPath victim))))
+      (let [undo (extract/undo! {:receipt (.getPath receipt)})]
+        (is (= :receipt-not-authentic (:error-type undo)))
+        (is (= "keep me" (slurp victim)))
+        (is (.exists target)))
+      (finally (delete-recursive! root)))))
+
+;; Fence re-review 2026-10-22 (F8): a forged :compiled-extraction receipt
+;; reached the MCP undo unsigned and overwrote any file it named.
+(deftest test-undo-refuses-a-forged-compiled-extraction-receipt
+  (let [root (create-caller-project!)
+        victim (doto (io/file root "victim.txt") (spit "keep me"))
+        forged (io/file root "forged.edn")]
+    (try
+      (spit forged (pr-str {:receipt-version 1 :operation :compiled-extraction
+                            :files [{:file (.getCanonicalPath victim) :original-source "pwned"
+                                     :result-source "keep me"}]}))
+      (is (= :receipt-not-authentic (:error-type (extract/undo! {:receipt (.getPath forged)}))))
+      (is (= "keep me" (slurp victim)))
+      (finally (delete-recursive! root)))))
+
+;; Fence re-review 2026-10-22 (N1), new-file extraction.
+(deftest test-plan-refuses-a-missing-source-root
+  (let [root (create-caller-project!)]
+    (try
+      (is (= :invalid-source-roots
+             (:error-type (extract/plan {:file (str (io/file root "src/my/app.clj")) :forms '[distill]
+                                         :to (str (io/file root "src/my/distillery.clj"))
+                                         :source-roots ["nope"]}))))
+      (finally (delete-recursive! root)))))

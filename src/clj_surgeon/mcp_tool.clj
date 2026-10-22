@@ -3,7 +3,9 @@
    [cheshire.core :as json]
    [clj-surgeon.extract :as extract]
    [clj-surgeon.file-ops :as file-ops]
+   [clj-surgeon.forms :as forms]
    [clj-surgeon.intent-transaction :as transaction]
+   [clj-surgeon.lint-gate :as lint-gate]
    [clj-surgeon.mcp-change-buffer :as change-buffer]
    [clj-surgeon.mcp-cold-verify :as cold-verify]
    [clj-surgeon.mcp-combinable-transaction :as combinable]
@@ -23,6 +25,8 @@
    [clj-surgeon.mcp-workspace :as workspace]
    [clj-surgeon.mcp-workspace-sources :as workspace-sources]
    [clj-surgeon.mcp-write-refusal :as write-refusal]
+   [clj-surgeon.move-into :as move-into]
+   [clj-surgeon.receipt-mac :as receipt-mac]
    [clj-surgeon.structural-lens :as structural-lens]
    [clojure.java.io :as io]
    [clojure.string :as str])
@@ -42,8 +46,12 @@
     "every exact per-edit guard remains authoritative. If inspect_clojure returned "
     "basis and next_call, preserve workspace_root, basis, site IDs, and verify; "
     "fill every decision and submit once. To move named owners into one new "
-    "namespace, use extraction once. Supply exact caller_changes or explicitly "
-    "ignored_caller_files when the decision is known. Omit public_forms to derive only "
+    "namespace, use extraction once; to move them into an existing namespace, add "
+    "into_existing and exactly one of above, below, at_start, or at_end. Callers in "
+    "other files are yours to decide: supply exact caller_changes or explicitly "
+    "ignored_caller_files, or send callers \"accept-proposed\" to write the exact "
+    "caller rewrites clj-surgeon proposes. A refusal for missing caller decisions lists "
+    "that proposal in callers_proposed. Omit public_forms to derive only "
     "mechanically required visibility from the same frozen snapshot; omission never "
     "accounts for a discovered caller. When the task already supplies the exact file, "
     "destination, forms, and any caller decisions, submit extraction directly without "
@@ -274,9 +282,20 @@
            :path-facts path-facts})))))
 
 (defn- resolve-extraction-paths
-  [root {:keys [file to caller-changes ignored-caller-files expect] :as request}]
+  [root {:keys [file to caller-changes ignored-caller-files expect into-existing] :as request}]
   (let [source (mcp-paths/resolve-source-path root file)
-        target (mcp-paths/resolve-new-source-path root to)
+        target (if into-existing
+                 (let [resolved (mcp-paths/resolve-source-path root to)]
+                   (if (and (not (:ok resolved))
+                            (not (.exists (.toFile (.resolve ^java.nio.file.Path root ^String to)))))
+                     {:ok false
+                      :error-type :into-existing-target-missing
+                      :error "into_existing needs a destination file that exists"
+                      :to to
+                      :next-step "Omit into_existing to create a new namespace file"
+                      :source-unchanged true}
+                     resolved))
+                 (mcp-paths/resolve-new-source-path root to))
         caller-spec (contract/tool-params->transaction
                       {:changes caller-changes
                        :expect {:changes (count caller-changes)
@@ -300,11 +319,25 @@
               :caller-changes (get-in callers [:spec :changes])
               :ignored-caller-files (mapv :path ignored))})))
 
+(defn- publicize-extraction-files
+  "Name every file a refusal or proposal reports relative to the workspace."
+  [root sources result]
+  (let [relative-paths (workspace-sources/relative-paths root sources)
+        public-path #(get relative-paths (str %) (str %))
+        file-entry #(cond-> % (:file %) (update :file public-path))]
+    (cond-> result
+      (:references result) (update :references (partial mapv file-entry))
+      (:callers-proposed result) (update :callers-proposed (partial mapv file-entry))
+      (:caller-problems result) (update :caller-problems (partial mapv file-entry))
+      (:callers-rewritten result) (update :callers-rewritten (partial mapv file-entry))
+      (:files result) (update :files #(mapv public-path %)))))
+
 (defn- publicize-extraction-decision-refusal
   [root sources request result]
   (if-not (= :extraction-decisions-required (:error-type result))
-    result
-    (let [relative-paths (workspace-sources/relative-paths root sources)
+    (publicize-extraction-files root sources result)
+    (let [result (publicize-extraction-files root sources result)
+          relative-paths (workspace-sources/relative-paths root sources)
           public-path #(get relative-paths % %)
           public-reference (fn [reference]
                              (cond-> reference
@@ -317,22 +350,75 @@
               (update :quoted-var-references
                       #(mapv public-reference %)))
           genuine-unknowns
-          (mapv #(update % :file public-path) (:genuine-unknowns result))]
+          (mapv #(update % :file public-path) (:genuine-unknowns result))
+          ;; @spec MCP-OP-PLAN-012
+          ;; @spec MCP-OP-PLAN-013
+          ;; The next call keeps the move, and never repeats the refused call:
+          ;; it offers the clean proposal for acceptance, or leaves the caller
+          ;; decisions as explicit null holes.
+          clean? (and (seq (:callers-proposed result)) (empty? (:caller-problems result)))
+          extraction
+          (cond-> {:file (:request-file request)
+                   :to (:request-to request)
+                   :forms (:forms request)
+                   :require-policy (name (:require-policy request))
+                   :source-hash (:source-hash completed-plan)}
+            (not (:into-existing request))
+            (assoc :public-forms (:required-public-forms completed-plan))
+
+            (:into-existing request)
+            (merge {:into-existing true} (:anchor request))
+
+            (:source-roots request)
+            (assoc :source-roots (:source-roots request))
+
+            clean?
+            (assoc :callers "accept-proposed"
+                   :callers-proposal-hash (:callers-proposal-hash result))
+
+            (not clean?)
+            (assoc :caller-changes nil :ignored-caller-files nil))]
       (assoc result
              :completed-plan completed-plan
              :genuine-unknowns genuine-unknowns
-             :next-call
-             {:workspace-root (.toString root)
-              :extraction
-              {:file (:request-file request)
-               :to (:request-to request)
-               :forms (:forms request)
-               :public-forms (:required-public-forms completed-plan)
-               :require-policy (name (:require-policy request))
-               :source-hash (:source-hash completed-plan)
-               :caller-changes []
-               :ignored-caller-files []}}
+             :next-call {:workspace-root (.toString root) :extraction extraction}
              :next-action "fill_caller_decisions_then_apply_once"))))
+
+(defn- extraction-target-ns
+  "The namespace an existing destination file declares."
+  [text]
+  (some-> (move-into/ns-form-source text)
+          (str/replace #"^\(ns\s+" "")
+          (str/split #"[\s)]" 2)
+          first))
+
+;; @spec MCP-OP-PLAN-016
+(defn- format-moved-block
+  "Format only the moved block of a move into an existing namespace, as
+  standalone text, and put it back in the destination's future source."
+  [config root compiled]
+  (let [format! (or (:format-candidates! config) formatter/format-candidates!)
+        block (:moved-block compiled)
+        to (:to compiled)
+        key (str to ".moved-block" (or (re-find #"\.clj[sc]?$" to) ".clj"))
+        formatted (format! (.toString root) (:formatter config) {key block})]
+    (if-not (:ok formatted)
+      formatted
+      (let [new-block (str/trimr (get (:future-sources formatted) key))
+            target (get-in compiled [:future-sources to])
+            at (str/index-of target block)]
+        (if (or (nil? at) (not= at (str/last-index-of target block)))
+          {:ok false
+           :error-type :moved-block-not-unique
+           :error "The moved block could not be located once in the destination"
+           :source-unchanged true}
+          (let [prepared (extraction/with-future-sources
+                           compiled
+                           (assoc (:future-sources compiled) to
+                                  (str (subs target 0 at) new-block (subs target (+ at (count block))))))]
+            (if (:ok prepared)
+              (assoc prepared :format (dissoc formatted :future-sources :ok))
+              prepared)))))))
 
 (defn- execute-extraction!
   [config root request receipt verify]
@@ -347,107 +433,160 @@
                         (change-buffer/compile-exact-profile
                           verify (:verification-profiles config)
                           (:verification-profile-source config)))
-        sources (workspace-sources/read-all root)
-        request (assoc request
-                       :source (get sources (:file request))
-                       :target-ns (extract/file-path->ns-name
-                                    (:to request) ["src" "test" "dev"])
-                       :workspace-sources sources)
-        compiled (->> (extraction/compile-extraction request)
-                      (publicize-extraction-decision-refusal
-                        root sources request))
-        compiled
-        (if (and (:ok compiled) (:formatter config))
-          (let [format! (or (:format-candidates! config)
-                            formatter/format-candidates!)
-                format-sources (select-keys (:future-sources compiled)
-                                            (:created-files compiled))
-                formatted (format! (.toString root) (:formatter config)
-                                   format-sources)]
-            (if (:ok formatted)
-              (let [future-sources (merge (:future-sources compiled)
-                                          (:future-sources formatted))
-                    prepared (extraction/with-future-sources
-                               compiled future-sources)]
-                (if (:ok prepared)
-                  (assoc prepared :format
-                         (dissoc formatted :future-sources :ok))
-                  prepared))
-              formatted))
-          compiled)]
-    (if-not (:ok compiled)
-      compiled
-      (let [project-root (.toString root)
-            original-files (vec (keys (:original-sources compiled)))
-            future-files (vec (keys (:future-sources compiled)))
-            baseline (when (and verify (nil? exact-profile))
-                       (cond
-                         (:capture-verification-baseline! config)
-                         ((:capture-verification-baseline! config)
-                          project-root verify (:verification-profiles config)
-                          original-files)
+        ;; Callers are discovered, and may be written, only under the declared
+        ;; (or requested) source roots; the source and destination are read
+        ;; wherever they are.
+        ;; @spec MCP-OP-PLAN-014
+        declared (workspace-sources/read-declared
+                   root (:source-roots request)
+                   {:max-files (or (:max-workspace-files config) 20000)
+                    :max-bytes (or (:max-workspace-bytes config) (* 256 1024 1024))})]
+    ;; Sources are a sorted map keyed by path; the bound's refusal is not.
+    (if-not (sorted? declared)
+      declared
+      (let [sources (cond-> declared
+                      true (assoc (str (:file request)) (slurp (str (:file request))))
+                      (:into-existing request) (assoc (str (:to request)) (slurp (str (:to request)))))
+            target-text (when (:into-existing request) (get sources (str (:to request))))
+            request (assoc request
+                           :source (get sources (str (:file request)))
+                           :target target-text
+                           :target-ns (if target-text
+                                        (extraction-target-ns target-text)
+                                        (extract/file-path->ns-name
+                                          (:to request) ["src" "test" "dev"]))
+                           :project-aliases (forms/load-project-aliases (str (:to request)) (str root))
+                           :max-caller-candidates (or (:max-caller-candidates config) 1000)
+                           :workspace-sources sources)
+            compiled (->> (extraction/compile-extraction request)
+                          (publicize-extraction-decision-refusal
+                            root sources request))
+            compiled
+            (if (and (:ok compiled) (:formatter config) (:moved-block compiled))
+              (format-moved-block config root compiled)
+              compiled)
+            compiled
+            (if (and (:ok compiled) (:formatter config) (seq (:created-files compiled)))
+              (let [format! (or (:format-candidates! config)
+                                formatter/format-candidates!)
+                    format-sources (select-keys (:future-sources compiled)
+                                                (:created-files compiled))
+                    formatted (format! (.toString root) (:formatter config)
+                                       format-sources)]
+                (if (:ok formatted)
+                  (let [future-sources (merge (:future-sources compiled)
+                                              (:future-sources formatted))
+                        prepared (extraction/with-future-sources
+                                   compiled future-sources)]
+                    (if (:ok prepared)
+                      (assoc prepared :format
+                             (dissoc formatted :future-sources :ok))
+                      prepared))
+                  formatted))
+              compiled)]
+        (if-not (:ok compiled)
+          compiled
+          (let [project-root (.toString root)
+                original-files (vec (keys (:original-sources compiled)))
+                future-files (vec (keys (:future-sources compiled)))
+                ;; @spec MCP-OP-PLAN-015
+                lint! (or (:lint! config) change-buffer/diagnostic-findings!)
+                lint-before (lint! project-root original-files)
+                baseline (when (and verify (nil? exact-profile))
+                           (cond
+                             (:capture-verification-baseline! config)
+                             ((:capture-verification-baseline! config)
+                              project-root verify (:verification-profiles config)
+                              original-files)
 
-                         (nil? (:verify! config))
-                         (change-buffer/capture-verification-baseline!
-                           project-root verify (:verification-profiles config)
-                           original-files)))]
-        (if (or (and exact-profile (not (:ok exact-profile)))
-                (and baseline (not (:ok baseline))))
-          {:error (if exact-profile
-                    "Exact project verification profile is unavailable"
-                    "Verification baseline capture failed before extraction")
-           :error-type (or (:error-type exact-profile)
-                           (:error-type baseline)
-                           :verification-baseline-failed)
-           :verification (or exact-profile baseline)
-           :source-unchanged true}
-          (let [result (extraction/commit! compiled)]
-            (if-not (:ok result)
-              result
-              (try
-                (file-ops/atomic-write! receipt (pr-str (:receipt result)))
-                (let [result (assoc result :receipt-file receipt)
-                      verification
-                      (when verify
-                        (cond
-                          exact-profile
-                          (change-buffer/run-exact-verification!
-                            project-root exact-profile)
+                             (nil? (:verify! config))
+                             (change-buffer/capture-verification-baseline!
+                               project-root verify (:verification-profiles config)
+                               original-files)))]
+            (if (or (and exact-profile (not (:ok exact-profile)))
+                    (and baseline (not (:ok baseline))))
+              {:error (if exact-profile
+                        "Exact project verification profile is unavailable"
+                        "Verification baseline capture failed before extraction")
+               :error-type (or (:error-type exact-profile)
+                               (:error-type baseline)
+                               :verification-baseline-failed)
+               :verification (or exact-profile baseline)
+               :source-unchanged true}
+              (let [result (extraction/commit! compiled)]
+                (if-not (:ok result)
+                  result
+                  (try
+                    ;; Signed, so the CLI undo can tell it from a forged receipt.
+                    (file-ops/atomic-write! receipt (pr-str (receipt-mac/sign (:receipt result))))
+                    (let [result (assoc result :receipt-file receipt)
+                          lint-after (if (:checked lint-before)
+                                       (lint! project-root future-files)
+                                       lint-before)
+                          introduced (when (and (:checked lint-before) (:checked lint-after))
+                                       (lint-gate/new-blocking-findings (:findings lint-before)
+                                                                        (:findings lint-after)))
+                          lint (if (:checked lint-after)
+                                 {:checked true :files (count future-files) :new-errors 0}
+                                 {:checked false :reason (:reason lint-after)})
+                          verification
+                          (cond
+                            ;; Checked before the write but not after: the
+                            ;; write does not stand.
+                            (and (:checked lint-before) (not (:checked lint-after)))
+                            {:ok false
+                             :error-type :lint-unverified
+                             :reason (:reason lint-after)}
 
-                          (:verify! config)
-                          ((:verify! config) project-root verify
-                                             (:verification-profiles config) future-files)
+                            (seq introduced)
+                            {:ok false
+                             :error-type :lint-regression
+                             :new-errors (vec (take 10 introduced))}
 
-                          :else
-                          (change-buffer/run-verification!
-                            project-root verify (:verification-profiles config)
-                            future-files baseline)))]
-                  (if (or (nil? verification) (:ok verification))
-                    (do
-                      (cold-verify/attach-undo-from-verification!
-                        project-root verification (:receipt-file result) (:receipt-hash result))
-                      (cond-> result verification (assoc :verification verification)))
-                    (let [rollback (extraction/undo! (:receipt result))
-                          rolled-back (boolean (:ok rollback))]
-                      (when rolled-back (.delete (io/file receipt)))
-                      {:error (if (= :verification-unverified
-                                     (:error-type verification))
-                                "Verification authority was unverified; extraction was rolled back"
-                                "Verification failed; extraction was rolled back")
-                       :error-type (or (:error-type verification)
-                                       :verification-failed)
-                       :verification verification
-                       :rolled-back rolled-back
-                       :recovery rollback
-                       :source-unchanged rolled-back})))
-                (catch Exception error
-                  (let [rollback (extraction/undo! (:receipt result))]
-                    {:error "Could not publish extraction receipt"
-                     :error-type :receipt-publish-failed
-                     :cause-error (.getMessage error)
-                     :rolled-back (boolean (:ok rollback))
-                     :recovery rollback
-                     :source-unchanged (boolean (:ok rollback))}))))))))))
+                            :else
+                            (when verify
+                              (cond
+                                exact-profile
+                                (change-buffer/run-exact-verification!
+                                  project-root exact-profile)
+
+                                (:verify! config)
+                                ((:verify! config) project-root verify
+                                                   (:verification-profiles config) future-files)
+
+                                :else
+                                (change-buffer/run-verification!
+                                  project-root verify (:verification-profiles config)
+                                  future-files baseline))))]
+                      (if (or (nil? verification) (:ok verification))
+                        (do
+                          (cold-verify/attach-undo-from-verification!
+                            project-root verification (:receipt-file result) (:receipt-hash result))
+                          (cond-> (assoc result :lint lint)
+                            verification (assoc :verification verification)
+                            (:callers-rewritten compiled) (assoc :callers-rewritten (:callers-rewritten compiled))))
+                        (let [rollback (extraction/undo! (:receipt result))
+                              rolled-back (boolean (:ok rollback))]
+                          (when rolled-back (.delete (io/file receipt)))
+                          {:error (case (:error-type verification)
+                                    :verification-unverified "Verification authority was unverified; extraction was rolled back"
+                                    :lint-regression "The extraction introduced clj-kondo errors or unresolved references; extraction was rolled back"
+                                    :lint-unverified "clj-kondo could not check the written files; extraction was rolled back"
+                                    "Verification failed; extraction was rolled back")
+                           :error-type (or (:error-type verification)
+                                           :verification-failed)
+                           :verification verification
+                           :rolled-back rolled-back
+                           :recovery rollback
+                           :source-unchanged rolled-back})))
+                    (catch Exception error
+                      (let [rollback (extraction/undo! (:receipt result))]
+                        {:error "Could not publish extraction receipt"
+                         :error-type :receipt-publish-failed
+                         :cause-error (.getMessage error)
+                         :rolled-back (boolean (:ok rollback))
+                         :recovery rollback
+                         :source-unchanged (boolean (:ok rollback))}))))))))))))
 
 (defn- default-receipt-dir
   [project-root]

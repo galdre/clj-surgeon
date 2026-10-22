@@ -763,8 +763,14 @@ guarded undo receipt:
 ```
 
 Every caller candidate must be changed or explicitly ignored; omission refuses
-before mutation. The destination parent must exist inside the workspace, and
-the destination itself must be absent. Undo through the returned receipt:
+before mutation. That refusal lists `callers_proposed`, the exact rewrites
+clj-surgeon can make; send `"callers": "accept-proposed"` instead of
+`caller_changes` to write them with the extraction. The destination parent
+must exist inside the workspace, and the destination itself must be absent,
+unless `"into_existing": true` moves the forms into an existing namespace at
+one anchor (`above`, `below`, `at_start`, or `at_end`). clj-kondo checks every
+written file afterwards and undoes the whole transaction on a new error or
+unresolved reference. Undo through the returned receipt:
 
 ```bash
 clj-surgeon :op :undo-extract! :receipt /path/from/undo_receipt

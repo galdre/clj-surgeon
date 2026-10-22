@@ -1,6 +1,6 @@
 # Move Forms Into an Existing Namespace
 
-**Status:** Stages 1, 2 and 3 built 2026-10-21 on branch `fix/cli-extract-public-forms`, and new-file `extract!` rewrites callers (decision 9); stage 4 open. Decisions answered by galdre on the decision page
+**Status:** Stages 1 to 4 built 2026-10-21 on branch `fix/cli-extract-public-forms`; new-file `extract!` proposes caller rewrites too (decision 9). Callers are written only on an explicit acceptance (see "Caller authority"). Decisions answered by galdre on the decision page
 "Move Into Existing Namespace" (key `move-into-ns`).
 **Motivating evidence:** the invoice refactoring trial (2026-10-21). An agent
 building domain vocabulary namespaces needed to move helpers such as
@@ -71,6 +71,29 @@ billing.invoice after has-email? moved.
   `--at-end` (after the last form). There are no line-number anchors; forms
   with no usable name, such as `(comment ...)`, cannot be anchors.
 - Exactly one of `--above`, `--below`, `--at-start`, `--at-end` is required.
+
+### Caller authority (revised 2026-10-21)
+
+The repository's design gives the model caller semantics and the tool the
+mechanics (`docs/high-level-design.md`, extraction planning; the MCP
+operation-contract design, "Extraction Planning Boundary"). The tool therefore
+proposes caller rewrites and writes them only when the request accepts them:
+
+- The dry run (`extract`) lists every caller it would rewrite under
+  `:callers-proposed`, with per-file rewrite and require counts, and every
+  reference it cannot rewrite exactly as a `:caller-not-rewritable` refusal.
+- `extract!` with callers in other files and no decision refuses with
+  `:extraction-decisions-required`, the proposal, and the next step, and
+  changes nothing. `--callers accept-proposed` writes the move and the
+  proposed rewrites as one transaction. A move with no outside callers needs
+  no decision. The target's own calls into the moved forms belong to the
+  move's destination and are always rewritten.
+- The MCP route keeps its caller decisions (`caller_changes`,
+  `ignored_caller_files`) and gains `callers: "accept-proposed"`; its
+  refusals carry the same proposal.
+
+Every rule below is unchanged; only who
+authorizes the write changed.
 
 ### Callers (answered 2026-10-21, decision page "Move Into: Callers")
 
@@ -247,6 +270,54 @@ definition; moved unqualified `::` keywords), `:lint`, and the receipt path. Eve
 Pure tests use literal sources. The field regression is the trial's
 `has-email?` move into `billing.customer`, which needs decisions 1, 4, 5 and 6
 at once.
+
+## MCP route (stage 4, 2026-10-21)
+
+Specified in the MCP operation-contract design ("Moving into an existing
+namespace and proposed caller rewrites") and specs `MCP-OP-PLAN-011` to
+`016`. The same planners serve the MCP `extraction` request and the
+`plan-extraction` mission; agents keep `caller_changes` and
+`ignored_caller_files` and gain `callers: "accept-proposed"`. The always-on
+clj-kondo gate found an existing MCP test whose agent-written caller edit
+called `sample.moved/helper` without requiring `sample.moved`; the test now
+adds the require.
+
+## Fence review (2026-10-21)
+
+An independent review with executed probes held path
+confinement, reader-eval, and subprocess argv, and returned NO-GO on these
+findings, each now fixed with a regression test:
+
+- `--receipt-out` could overwrite any file, the move's target included; it
+  now refuses a non-`.edn`, existing, or planned path and writes atomically.
+- CLI EDN values and a repository's `deps.edn` were read with
+  `clojure.core/read-string`, which evaluates `#=`; both use `clojure.edn`.
+- Undo restored whatever paths an unauthenticated receipt named; CLI
+  receipts are now signed with a per-user key (`clj-surgeon.receipt-mac`) and
+  undo refuses an unsigned or altered one.
+- The refusal's `next_call` dropped the move fields and could repeat the
+  refused call; acceptance did not bind to the reviewed proposal; planning
+  dropped `source_roots` (see the MCP design, proposal hash).
+- The walk descended into symlinked directories outside the workspace, and
+  read every file before any bound; it now stops at the workspace and bounds
+  files and bytes from the listing before reading.
+- The CLI lint gate had no timeout, and a post-write check that could not
+  finish kept the write; it times out and restores, on both routes.
+- New-file `extract` did not validate `--source-roots`, and an empty root
+  was accepted.
+- Small: `.clj-surgeon.edn` lookup stops at the workspace, clj-kondo runs in
+  the workspace, and a `--to` naming the source refuses as a path collision.
+
+The re-review (2026-10-22) closed those and found the rest, also fixed:
+planning through MCP now applies the walk's file and byte bounds; receipts
+the MCP server writes are signed too, and the CLI undo checks the signature
+before routing any receipt; a requested source root that is missing or
+resolves outside the workspace refuses instead of being dropped (a dropped
+root hid callers); CLI dispatch stops its `.clj-surgeon.edn` lookup at the
+workspace; the receipt key is created owner-only in one step, and a key other
+users can read refuses. Accepted as Low: `callers_proposal_hash` is optional,
+and planning's next call leaves the caller decision open rather than carrying
+the hash.
 
 ## Real-program evidence (stage 3, 2026-10-21)
 

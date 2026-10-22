@@ -4,6 +4,8 @@
    [clj-surgeon.extract :as extract]
    [clj-surgeon.file-ops :as file-ops]
    [clj-surgeon.intent-transaction :as transaction]
+   [clj-surgeon.move-callers :as move-callers]
+   [clj-surgeon.move-into :as move-into]
    [clj-surgeon.structural-lens :as structural-lens]
    [clojure.java.io :as io]
    [clojure.set :as set]
@@ -177,22 +179,134 @@
                 :edits expected-edits
                 :files (count (caller-files changes))}})))
 
+;; ============================================================
+;; The move: the source and destination futures and the caller proposal
+;; ============================================================
+
+(defn- compile-new-namespace
+  "Plan an extraction into a new namespace. Returns the source and
+  destination futures, the structural caller candidates, and the caller
+  proposal, or a refusal."
+  [{:keys [file to forms public-forms require-policy source target-ns workspace-sources]}
+   public-forms-supplied? authority max-candidates]
+  (let [plan (extract/compile-plan
+               {:file file
+                :source source
+                :forms forms
+                :public-forms (or public-forms [])
+                :derive-required-public-forms (not public-forms-supplied?)
+                :to to
+                :target-ns target-ns
+                :workspace-sources workspace-sources
+                :require-policy require-policy})]
+    (cond
+      (:error plan)
+      (refusal (or (:error-type plan) :extraction-plan-refused)
+               (:error plan)
+               (select-keys plan [:invalid-public-forms :unsupported-public-forms]))
+
+      (and public-forms-supplied? (seq (:missing-required-public-forms plan)))
+      (refusal :required-public-forms-missing
+               "Every moved private form called by remaining source must be public"
+               {:required-public-forms (:required-public-forms plan)
+                :missing-public-forms (:missing-required-public-forms plan)})
+
+      :else
+      (let [proposal (extract/with-caller-rewrites
+                       plan workspace-sources
+                       {:caller-authority authority :max-candidates max-candidates})]
+        (if (:error proposal)
+          (refusal (:error-type proposal) (:error proposal)
+                   (dissoc proposal :ok :error :error-type))
+          (let [future (extract/compile-candidates
+                         {:source source
+                          :source-file file
+                          :target-file to
+                          :form-ranges (:_form-texts plan)
+                          :target-source (:_new-file-content plan)
+                          :target-ns target-ns
+                          :target-alias (:target-alias plan)
+                          :source-referred-forms (:_source-referred-forms plan)})]
+            {:ok true
+             :plan plan
+             :form-count (:form-count plan)
+             :forms (:forms-to-extract plan)
+             :require-policy (:require-policy plan)
+             :source-future (:source future)
+             :target-future (:target future)
+             :target-original nil
+             :candidates (set/union (set (:callers-to-review plan))
+                                    (set (map :file (:quoted-var-references plan))))
+             :callers (:_callers proposal)
+             :callers-proposed (:callers-proposed proposal)
+             :caller-problems (:caller-problems proposal)
+             :callers-to-review (:callers-to-review plan)
+             :quoted-var-references (:quoted-var-references plan)}))))))
+
+(defn- compile-existing-namespace
+  "Plan a move into an existing namespace through the shared move planner."
+  [{:keys [file to forms public-forms source target target-ns anchor workspace-sources
+           project-aliases]}
+   public-forms-supplied? authority max-candidates]
+  (let [moved (move-into/compile-move
+                (cond-> {:source-file file
+                         :source source
+                         :target-file to
+                         :target target
+                         :target-ns target-ns
+                         :forms (mapv symbol forms)
+                         :anchor anchor
+                         :project-aliases (or project-aliases {})
+                         :workspace-sources workspace-sources
+                         :caller-authority authority
+                         :max-candidates max-candidates}
+                  public-forms-supplied? (assoc :public-forms (mapv symbol public-forms))))]
+    (if-not (:ok moved)
+      (refusal (or (:error-type moved) :move-refused)
+               (or (:error moved) "The move refused")
+               (dissoc moved :ok :error :error-type :source-unchanged :target-unchanged))
+      (let [problem-files (set (map :file (:caller-problems moved)))]
+        {:ok true
+         :form-count (count (:moved-forms moved))
+         :forms (:moved-forms moved)
+         :require-policy :merged
+         :source-future (:source moved)
+         :target-future (:target moved)
+         :target-original target
+         :block (:block moved)
+         :candidates (into (set (keys (:callers moved))) problem-files)
+         :callers (:callers moved)
+         :callers-proposed (:callers-rewritten moved)
+         :caller-problems (:caller-problems moved)
+         :callers-to-review (vec (sort (into (set (keys (:callers moved))) problem-files)))
+         :quoted-var-references []
+         :public-forms (:public-forms moved)
+         :warnings (:warnings moved)}))))
+
 ;; @spec MCP-OP-PLAN-004
 ;; @spec MCP-OP-PLAN-007
 ;; @spec MCP-OP-PLAN-008
 ;; @spec MCP-OP-PLAN-009
 ;; @spec MCP-OP-PLAN-010
+;; @spec MCP-OP-PLAN-011
+;; @spec MCP-OP-PLAN-012
+;; @spec MCP-OP-PLAN-013
 (defn compile-extraction
-  "Compile extraction and exact caller changes against one captured snapshot."
-  [{:keys [file to forms public-forms require-policy source target-ns
-           workspace-sources source-hash created-directories]
-    :or {require-policy :minimal workspace-sources {}
-         created-directories []}
+  "Compile an extraction or a move into an existing namespace, and its
+  callers, against one captured snapshot. The kernel proposes caller
+  rewrites; it writes them only on callers :accept-proposed, and otherwise
+  the request's own caller decisions must account for every candidate."
+  [{:keys [file to source source-hash created-directories into-existing callers
+           max-caller-candidates expect-derived]
+    :or {created-directories []}
     :as request}]
   (let [public-forms-supplied? (contains? request :public-forms)
         request (normalize-mechanical-fields request)
         {:keys [expect caller-changes ignored-caller-files]} request
-        validation (validate-request request)]
+        validation (validate-request request)
+        accept? (= :accept-proposed callers)
+        authority (if accept? :kernel :model)
+        expected-proposal (:callers-proposal-hash request)]
     (if-not (:ok validation)
       validation
       (if (and source-hash
@@ -201,70 +315,57 @@
                  "The extraction source changed after planning"
                  {:expected source-hash
                   :actual (structural-lens/source-hash source)})
-        (let [plan-input {:file file
-                          :source source
-                          :forms forms
-                          :public-forms (or public-forms [])
-                          :derive-required-public-forms
-                          (not public-forms-supplied?)
-                          :to to
-                          :target-ns target-ns
-                          :workspace-sources workspace-sources
-                          :require-policy require-policy}
-              plan (extract/compile-plan plan-input)]
-          (cond
-            (:error plan)
-            (refusal (or (:error-type plan) :extraction-plan-refused)
-                     (:error plan)
-                     (select-keys plan [:invalid-public-forms
-                                        :unsupported-public-forms]))
-
-            (and public-forms-supplied?
-                 (seq (:missing-required-public-forms plan)))
-            (refusal :required-public-forms-missing
-                     "Every moved private form called by remaining source must be public"
-                     {:required-public-forms (:required-public-forms plan)
-                      :missing-public-forms
-                      (:missing-required-public-forms plan)})
-
-            (not= (:forms expect) (:form-count plan))
-            (refusal :extraction-count-mismatch
-                     "The compiled extraction form count did not match expect.forms"
-                     {:expected (:forms expect)
-                      :actual (:form-count plan)})
-
-            :else
+        (let [moved (if into-existing
+                      (compile-existing-namespace request public-forms-supplied? authority
+                                                  max-caller-candidates)
+                      (compile-new-namespace request public-forms-supplied? authority
+                                             max-caller-candidates))]
+          (if-not (:ok moved)
+            moved
             (try
-              (let [future
-                    (extract/compile-candidates
-                      {:source source
-                       :source-file file
-                       :target-file to
-                       :form-ranges (:_form-texts plan)
-                       :target-source (:_new-file-content plan)
-                       :target-ns target-ns
-                       :target-alias (:target-alias plan)
-                       :source-referred-forms (:_source-referred-forms plan)})
+              (let [workspace-sources (:workspace-sources request)
+                    proposal (move-callers/proposal-hash (:callers moved) workspace-sources)
                     changed-caller-files (caller-files caller-changes)
                     forbidden (set/intersection #{file to} changed-caller-files)
-                    candidates (set/union
-                                 (set (:callers-to-review plan))
-                                 (set (map :file (:quoted-var-references plan))))
-                    accounted (set/union changed-caller-files
-                                         (set ignored-caller-files))
-                    omitted (set/difference candidates accounted)
-                    caller-sources (select-keys workspace-sources
-                                                changed-caller-files)
-                    caller-result (compile-callers
-                                    caller-sources caller-changes
-                                    (:caller-edits expect))
-                    originals (merge (sorted-map file source)
-                                     (:original-sources caller-result))
-                    futures (merge (sorted-map file (:source future)
-                                               to (:target future))
+                    accounted (set/union changed-caller-files (set ignored-caller-files))
+                    omitted (if accept? #{} (set/difference (:candidates moved) accounted))
+                    caller-sources (select-keys workspace-sources changed-caller-files)
+                    caller-result (if accept?
+                                    {:ok true
+                                     :match-count (reduce + 0 (map :rewritten (:callers-proposed moved)))
+                                     :original-sources (select-keys workspace-sources (keys (:callers moved)))
+                                     :future-sources (:callers moved)}
+                                    (compile-callers caller-sources caller-changes
+                                                     (if expect-derived
+                                                       (reduce + (map #(get-in % [:expect :matches]) caller-changes))
+                                                       (:caller-edits expect))))
+                    originals (cond-> (merge (sorted-map file source)
+                                             (:original-sources caller-result))
+                                (:target-original moved) (assoc to (:target-original moved)))
+                    futures (merge (sorted-map file (:source-future moved)
+                                               to (:target-future moved))
                                    (:future-sources caller-result))
-                    actual-files (count futures)]
+                    actual-files (count futures)
+                    expect (if expect-derived
+                             {:forms (:form-count moved)
+                              :caller-edits (:match-count caller-result)
+                              :files actual-files}
+                             expect)]
                 (cond
+                  (and accept? expected-proposal (not= expected-proposal proposal))
+                  (refusal :stale-caller-proposal
+                           "The callers changed since the proposal you accepted; nothing was written"
+                           {:expected expected-proposal
+                            :actual proposal
+                            :callers-proposed (:callers-proposed moved)
+                            :callers-proposal-hash proposal})
+
+                  (not= (:forms expect) (:form-count moved))
+                  (refusal :extraction-count-mismatch
+                           "The compiled extraction form count did not match expect.forms"
+                           {:expected (:forms expect)
+                            :actual (:form-count moved)})
+
                   (seq forbidden)
                   (refusal :caller-change-path-collision
                            "caller_changes may not target extraction.file or extraction.to"
@@ -286,20 +387,23 @@
                        :mutation-attempted false
                        :write-authority false
                        :remedy
-                       "Fill each caller disposition in next_call and call apply_clojure_changes once."
+                       (str "Fill each caller disposition in next_call and call apply_clojure_changes once, "
+                            "or send callers \"accept-proposed\" to write the proposed rewrites listed in callers_proposed.")
                        :genuine-unknowns unknowns
+                       :callers-proposed (:callers-proposed moved)
+                       :caller-problems (:caller-problems moved)
+                       :callers-proposal-hash proposal
                        :completed-plan
                        {:file file
                         :to to
-                        :forms-to-extract (:forms-to-extract plan)
-                        :form-count (:form-count plan)
+                        :forms-to-extract (:forms moved)
+                        :form-count (:form-count moved)
                         :required-public-forms
-                        (:required-public-forms plan)
-                        :require-policy (:require-policy plan)
-                        :source-hash (:_source-hash plan)
-                        :callers-to-review (:callers-to-review plan)
-                        :quoted-var-references
-                        (:quoted-var-references plan)}}))
+                        (or (some-> moved :plan :required-public-forms) [])
+                        :require-policy (:require-policy moved)
+                        :source-hash (structural-lens/source-hash source)
+                        :callers-to-review (:callers-to-review moved)
+                        :quoted-var-references (:quoted-var-references moved)}}))
 
                   (not (:ok caller-result))
                   caller-result
@@ -310,21 +414,25 @@
                            {:expected (:files expect) :actual actual-files})
 
                   :else
-                  {:ok true
-                   :operation :compiled-extraction
-                   :caller-proof structural-caller-proof
-                   :file file
-                   :to to
-                   :forms (:forms-to-extract plan)
-                   :form-count (:form-count plan)
-                   :caller-edit-count (:match-count caller-result)
-                   :require-policy (:require-policy plan)
-                   :callers-to-review (:callers-to-review plan)
-                   :quoted-var-references (:quoted-var-references plan)
-                   :original-sources originals
-                   :future-sources futures
-                   :created-directories (vec created-directories)
-                   :created-files [to]}))
+                  (cond->
+                    {:ok true
+                     :operation :compiled-extraction
+                     :caller-proof structural-caller-proof
+                     :file file
+                     :to to
+                     :forms (:forms moved)
+                     :form-count (:form-count moved)
+                     :caller-edit-count (:match-count caller-result)
+                     :require-policy (:require-policy moved)
+                     :callers-to-review (:callers-to-review moved)
+                     :quoted-var-references (:quoted-var-references moved)
+                     :original-sources originals
+                     :future-sources futures
+                     :created-directories (vec created-directories)
+                     :created-files (if into-existing [] [to])}
+                    accept? (assoc :callers-rewritten (:callers-proposed moved))
+                    (:block moved) (assoc :moved-block (:block moved))
+                    (seq (:warnings moved)) (assoc :warnings (:warnings moved)))))
               (catch Exception error
                 (refusal :invalid-extraction-result
                          (.getMessage error)

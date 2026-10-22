@@ -179,15 +179,18 @@
 ;; ============================================================
 
 (defn- find-config-file
-  "Walk up from `start` (a file or dir path) looking for `.clj-surgeon.edn`.
-   Return the java.io.File for the first one found, or nil."
-  [start]
+  "Walk up from `start` (a file or dir path) looking for `.clj-surgeon.edn`,
+   no higher than `root` when given. Return the java.io.File for the first
+   one found, or nil."
+  [start root]
   (let [start-file (some-> start io/file .getAbsoluteFile)
         start-dir (if (and start-file (.isDirectory start-file))
                     start-file
-                    (some-> start-file .getParentFile))]
+                    (some-> start-file .getParentFile))
+        root-path (some-> root io/file .getCanonicalFile .toPath)]
     (loop [dir start-dir]
-      (when dir
+      (when (and dir (or (nil? root-path)
+                         (.startsWith (.toPath (.getCanonicalFile dir)) root-path)))
         (let [cfg (io/file dir ".clj-surgeon.edn")]
           (if (.exists cfg)
             cfg
@@ -215,18 +218,32 @@
                    [k (compile-spec k v)])))))
 
 (defn load-project-aliases
-  "Find `.clj-surgeon.edn` by walking up from `start` (a file or dir path).
-   Return the compiled aliases map, or `{}` if no config found."
-  [start]
-  (if-let [f (find-config-file start)]
-    (read-config f)
-    {}))
+  "Find `.clj-surgeon.edn` by walking up from `start` (a file or dir path),
+   no higher than the workspace `root` when given. Return the compiled
+   aliases map, or `{}` if no config found."
+  ([start] (load-project-aliases start nil))
+  ([start root]
+   (if-let [f (find-config-file start root)]
+     (read-config f)
+     {})))
+
+(defn workspace-root-of
+  "The nearest directory at or above `path` holding deps.edn, bb.edn,
+   project.clj or .git, or nil."
+  [path]
+  (let [start (some-> path io/file .getAbsoluteFile)
+        dir (if (and start (.isDirectory start)) start (some-> start .getParentFile))]
+    (->> (iterate #(some-> % .getParentFile) dir)
+         (take-while some?)
+         (filter (fn [d] (some #(.exists (io/file d %)) ["deps.edn" "bb.edn" "project.clj" ".git"])))
+         first)))
 
 (defn init-from-file!
-  "Resolve `.clj-surgeon.edn` near `file-path`, populate `project-aliases`.
-   Call once per CLI invocation, from the top-level dispatch."
+  "Resolve `.clj-surgeon.edn` near `file-path`, no higher than its workspace
+   root, and populate `project-aliases`. Call once per CLI invocation, from
+   the top-level dispatch."
   [file-path]
-  (reset! project-aliases (load-project-aliases file-path)))
+  (reset! project-aliases (load-project-aliases file-path (workspace-root-of file-path))))
 
 ;; ============================================================
 ;; Classification: the one function everything else calls

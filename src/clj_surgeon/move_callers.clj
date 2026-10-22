@@ -748,24 +748,44 @@
   may reference a moved Var. Every caller spells the source namespace, in a
   libspec, an alias declaration or a qualified name; a prefix-list libspec
   spells only its last segment. Returns {:callers [changed results]
-  :problems [...]}."
-  [{:keys [sources exclude source-ns target-ns target-file moved moved-classes]}]
+  :problems [...]}, or {:budget-exceeded {:candidates :limit}} when
+  `max-candidates` is given and more files than that are candidates, before
+  any candidate is parsed."
+  [{:keys [sources exclude source-ns target-ns target-file moved moved-classes
+           max-candidates]}]
   (let [last-segment (last (str/split source-ns #"\."))
         names (into (set moved) moved-classes)
         candidate? (fn [text]
                      (and (some #(str/includes? text %) names)
                           (or (str/includes? text source-ns)
                               (str/includes? text last-segment))))
-        results (->> (apply dissoc sources exclude)
-                     (sort-by key)
-                     (filter (comp candidate? val))
-                     (mapv (fn [[path text]]
-                             (rewrite-caller {:file path :text text :mode :caller
-                                              :moved moved :moved-classes moved-classes
-                                              :source-ns source-ns :target-ns target-ns
-                                              :target-file target-file}))))]
-    {:callers (filterv :changed results)
-     :problems (vec (mapcat :problems results))}))
+        candidates (->> (apply dissoc sources exclude)
+                        (sort-by key)
+                        (filter (comp candidate? val)))
+        candidate-count (count candidates)]
+    (if (and max-candidates (> candidate-count max-candidates))
+      {:budget-exceeded {:candidates candidate-count :limit max-candidates}}
+      (let [results (->> candidates
+                      (mapv (fn [[path text]]
+                              (rewrite-caller {:file path :text text :mode :caller
+                                               :moved moved :moved-classes moved-classes
+                                               :source-ns source-ns :target-ns target-ns
+                                               :target-file target-file}))))]
+        {:callers (filterv :changed results)
+         :problems (vec (mapcat :problems results))}))))
+
+(defn budget-refusal
+  "The refusal for a caller scan over its candidate-file bound."
+  [{:keys [candidates limit]}]
+  {:ok false
+   :error-type :caller-scan-budget-exceeded
+   :error (str candidates " files may call the moved forms, more than the " limit " this request may scan")
+   :candidates candidates
+   :limit limit
+   :next-step "Narrow the scan with source_roots, then retry"
+   :source-unchanged true
+   :target-unchanged true
+   :files-unchanged true})
 
 (defn caller-summary
   "What a result reports about the rewritten callers."
@@ -776,3 +796,69 @@
            :requires-added requires-added
            :requires-removed requires-removed})
         callers))
+
+(defn invalid-source-roots
+  "The source-roots entries that are not non-empty relative paths inside the
+  workspace."
+  [roots]
+  (vec (remove #(and (string? %)
+                     (not (str/blank? %))
+                     (not (.isAbsolute (java.io.File. ^String %)))
+                     (not-any? #{".."} (str/split % #"[/\\]")))
+               roots)))
+
+(defn source-roots-refusal
+  "A refusal naming the invalid source roots, or nil. With `unusable`, a
+  function from roots to those that are missing or leave the workspace, a
+  requested root must also exist inside it."
+  [roots & [unusable]]
+  (when-let [bad (or (some-> roots invalid-source-roots not-empty)
+                     (some-> roots (#(when unusable (unusable %))) not-empty))]
+    {:ok false
+     :error-type :invalid-source-roots
+     :error "source roots must be directories relative to the workspace, inside it"
+     :source-roots bad
+     :source-unchanged true
+     :target-unchanged true
+     :files-unchanged true}))
+
+(defn proposal-hash
+  "SHA-256 identity of a caller proposal: each proposed file with the hash of
+  the bytes it was read from and of the bytes it would get. Acceptance bound
+  to this hash refuses if apply would write anything else."
+  [callers originals]
+  (let [sha (fn [^String text]
+              (let [digest (.digest (java.security.MessageDigest/getInstance "SHA-256")
+                                    (.getBytes text "UTF-8"))]
+                (apply str (map #(format "%02x" (bit-and % 0xff)) digest))))]
+    (sha (pr-str (vec (for [[path future] (sort-by key callers)]
+                        [path (sha (str (get originals path))) (sha future)]))))))
+
+(defn callers-decision
+  "Read a request's decision about proposed caller rewrites: nil when
+  absent, :accept-proposed, or a refusal for any other value. The model
+  chooses caller semantics; the tool writes a caller only when the request
+  accepts its proposal."
+  [value]
+  (cond
+    (nil? value) nil
+    (= "accept-proposed" (name value)) :accept-proposed
+    :else {:ok false
+           :error-type :invalid-callers-decision
+           :error "callers takes one value: accept-proposed"
+           :callers (str value)
+           :source-unchanged true
+           :target-unchanged true
+           :files-unchanged true}))
+
+(defn decisions-required
+  "The refusal for a request with proposed caller rewrites and no decision."
+  [proposed next-step]
+  {:ok false
+   :error-type :extraction-decisions-required
+   :error "Other files call the moved forms; accept the proposed rewrites or change those callers first"
+   :callers-proposed proposed
+   :next-step next-step
+   :source-unchanged true
+   :target-unchanged true
+   :files-unchanged true})

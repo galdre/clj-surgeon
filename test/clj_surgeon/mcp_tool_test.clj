@@ -758,7 +758,11 @@
                       "  (:require [clojure.string :as str]))\n\n"
                       "(defn helper [x] (str/upper-case x))\n\n"
                       "(defn retained [] :ok)\n")
-        caller-original (str "(ns sample.user)\n\n"
+        ;; The caller requires what it calls. Before the always-on lint gate
+        ;; (2026-10-21) this test rewrote the call to sample.moved/helper with
+        ;; no require of sample.moved, which clj-kondo reports as an
+        ;; unresolved namespace and the gate now rolls back.
+        caller-original (str "(ns sample.user\n  (:require [sample.core]))\n\n"
                              "(defn use-helper [x]\n"
                              "  (sample.core/helper x))\n")]
     (try
@@ -789,7 +793,13 @@
                   :forms ["use-helper"]
                   :find "sample.core/helper"
                   :replace "sample.moved/helper"
-                  :expect {:matches 1 :each_form 1 :each_file 1}}]
+                  :expect {:matches 1 :each_form 1 :each_file 1}}
+                 {:id "require-moved"
+                  :files ["src/sample/user.clj"]
+                  :owner {:kind "namespace" :name "sample.user"}
+                  :find "sample.core"
+                  :replace "sample.moved"
+                  :expect {:matches 1 :each_file 1}}]
                 :ignored_caller_files []}})]
         (is (:ok plan) (pr-str plan))
         (is (= ["src/sample/user.clj"]
@@ -805,12 +815,12 @@
                              (assoc result :elapsed_ms 0.1))
                            "not semantic completeness"))
         (is (= 1 (:changes result)))
-        (is (= 2 (:edits result)))
+        (is (= 3 (:edits result)))
         (is (= 3 (:files result)))
         (is (.exists target-file))
         (is (= "(ns sample.core\n  (:require [clojure.string :as str]))\n\n(defn retained [] :ok)\n"
                (slurp source-file)))
-        (is (= (str "(ns sample.user)\n\n"
+        (is (= (str "(ns sample.user\n  (:require [sample.moved]))\n\n"
                     "(defn use-helper [x]\n"
                     "  (sample.moved/helper x))\n")
                (slurp caller-file)))

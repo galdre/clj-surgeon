@@ -310,3 +310,30 @@
       (finally
         (rm-rf dir)
         (reset! forms/project-aliases {})))))
+
+;; Fence review 2026-10-21 (F11): the .clj-surgeon.edn lookup walked above
+;; the workspace, so a config in a parent directory changed what the move saw.
+(deftest project-aliases-stop-at-the-workspace-root
+  (let [base (.toFile (java.nio.file.Files/createTempDirectory "aliases-root" (make-array java.nio.file.attribute.FileAttribute 0)))
+        project (doto (clojure.java.io/file base "project" "src") .mkdirs)
+        source (clojure.java.io/file project "a.clj")]
+    (try
+      (spit source "(ns a)\n")
+      (spit (clojure.java.io/file base ".clj-surgeon.edn") "{:aliases {\"defthing\" {:kind :def}}}")
+      (is (contains? (forms/load-project-aliases (str source)) "defthing"))
+      (is (= {} (forms/load-project-aliases (str source) (str (clojure.java.io/file base "project")))))
+      (finally (doseq [f (reverse (file-seq base))] (.delete f))))))
+
+;; Fence re-review 2026-10-22 (N2): CLI dispatch read a .clj-surgeon.edn above
+;; the workspace, and a malformed one there broke every command.
+(deftest cli-config-lookup-stops-at-the-workspace
+  (let [base (.toFile (java.nio.file.Files/createTempDirectory "cli-config-root" (make-array java.nio.file.attribute.FileAttribute 0)))
+        project (doto (clojure.java.io/file base "project") .mkdirs)
+        source (doto (clojure.java.io/file project "src" "a.clj") (-> .getParentFile .mkdirs))]
+    (try
+      (spit source "(ns a)\n")
+      (spit (clojure.java.io/file project "deps.edn") "{}")
+      (spit (clojure.java.io/file base ".clj-surgeon.edn") "{:aliases {")
+      (is (= {} (forms/init-from-file! (str source))))
+      (finally (reset! forms/project-aliases {})
+               (doseq [f (reverse (file-seq base))] (.delete f))))))

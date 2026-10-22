@@ -16,6 +16,7 @@
    [clj-surgeon.mcp-http-server-test]
    [clj-surgeon.mcp-inspect-contract-test]
    [clj-surgeon.mcp-inspect-tool-test]
+   [clj-surgeon.mcp-move-into-test]
    [clj-surgeon.mcp-intent-contract-test]
    [clj-surgeon.mcp-operation-async-test]
    [clj-surgeon.mcp-operation-registry-test]
@@ -59,6 +60,7 @@
           'clj-surgeon.mcp-hot-verify-test
           'clj-surgeon.mcp-inspect-contract-test
           'clj-surgeon.mcp-inspect-tool-test
+          'clj-surgeon.mcp-move-into-test
           'clj-surgeon.mcp-intent-contract-test
           'clj-surgeon.mcp-operation-async-test
           'clj-surgeon.mcp-operation-registry-test

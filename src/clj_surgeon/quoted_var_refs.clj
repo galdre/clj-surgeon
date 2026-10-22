@@ -32,6 +32,22 @@
                           (str/split #"\.")
                           last))))
 
+(defn- list-children
+  "The entries of a directory the walk descends into."
+  [dir]
+  (or (seq (.listFiles dir)) []))
+
+(defn unusable-source-roots
+  "The requested source roots that do not exist as directories inside the
+  workspace once symlinks are resolved. A dropped root would hide callers."
+  [project-root source-roots]
+  (let [root (mcp-paths/real-root project-root)]
+    (vec (remove (fn [relative]
+                   (let [dir (-> root (.resolve (str relative)) .toFile)]
+                     (and (.isDirectory dir)
+                          (.startsWith (.toPath (.getCanonicalFile dir)) root))))
+                 source-roots))))
+
 (defn workspace-files
   "Canonical Clojure files under the workspace's declared source roots, or
   under `source-roots` (relative to the workspace) when given, confined to
@@ -40,9 +56,11 @@
    (workspace-files project-root (source-anchor/workspace-source-roots project-root)))
   ([project-root source-roots]
    (let [root (mcp-paths/real-root project-root)
+         inside? #(.startsWith (.toPath (.getCanonicalFile %)) root)
          roots (->> source-roots
                     (map #(-> root (.resolve (str %)) .toFile))
                     (filter #(.exists %))
+                    (filter inside?)
                     (map #(.getCanonicalFile %))
                     distinct
                     (sort-by #(-> % .toPath .getNameCount))
@@ -57,11 +75,14 @@
           (mapcat
             (fn [source-root]
               (tree-seq
+                ;; Never descend into a directory whose real path leaves the
+                ;; workspace, such as a symlink to /usr.
                 (fn [file]
                   (and (.isDirectory file)
                        (not (contains? excluded-directory-names
-                                       (.getName file)))))
-                (fn [file] (or (seq (.listFiles file)) []))
+                                       (.getName file)))
+                       (inside? file)))
+                list-children
                 source-root)))
           (filter clojure-source-file?)
           (filter #(relative-to-root root (.getCanonicalFile %)))

@@ -19,8 +19,8 @@ is cut.
   source requires that only the moved forms used. It refuses
   unknown or ambiguous anchors, name clashes, symbols whose meaning would
   change, forms left behind that a moved form calls, alias conflicts and
-  circular requires before writing. Callers in other files are rewritten in
-  the same move: aliased references through the caller's alias for the
+  circular requires before writing. Callers in other files are proposed,
+  and rewritten in the same move with `--callers accept-proposed`: aliased references through the caller's alias for the
   target, fully qualified references and var quotes with the new namespace,
   and referred or renamed names on the target libspec (`:refer :all` and
   `:use` callers gain a refer); references inside reader conditionals are
@@ -37,14 +37,28 @@ is cut.
   receipt.
   Plan: `docs/plans/move-into-existing-namespace.md`.
 
-- `extract!` to a new namespace rewrites callers in other files too, by the
-  same rules as a move into an existing namespace, and reports them under
-  `:callers-rewritten` and `:callers-to-review`. It finds callers under the
+- `extract!` to a new namespace proposes caller rewrites in other files too,
+  by the same rules as a move into an existing namespace. The dry run lists
+  them under `:callers-proposed`; `extract!` writes them only with
+  `--callers accept-proposed`, and otherwise refuses with
+  `:extraction-decisions-required` and changes nothing. A successful run
+  reports `:callers-rewritten` and `:callers-to-review`. It finds callers under the
   declared source roots, or `--source-roots`, instead of every file under
   the project root. Every written file is hash-fenced and linted together; a
   new clj-kondo error or unresolved reference restores them all. Receipts
   are version 2 and list the callers; `undo-extract!` still accepts
   version 1.
+
+- MCP `extraction` moves forms into an existing namespace with
+  `into_existing` and one of `above`, `below`, `at_start`, `at_end`, and
+  accepts `callers: "accept-proposed"` to write the exact caller rewrites the
+  kernel proposes; the refusal for missing caller decisions lists them under
+  `callers_proposed`. `caller_changes` and `ignored_caller_files` keep their
+  meaning. Callers are found under the declared source roots (or
+  `source_roots`), at most 1,000 candidate files. clj-kondo now runs over
+  every file an extraction writes, before and after, and undoes the
+  transaction on a new error or unresolved reference; for a move, the
+  formatter formats only the moved block.
 
 - The CLI accepts GNU-style arguments: `clj-surgeon ls --file src/a.clj`,
   `--key=value`, and a bare `--flag` for `true`. The original
@@ -54,6 +68,23 @@ is cut.
 
 - `:extract` and `:extract!` accept `:public-forms`, an EDN vector of moved
   private forms to make public.
+
+### Security
+
+- CLI EDN argument values and a repository's `deps.edn` (read by `ls-tree`)
+  were read with `clojure.core/read-string`, which evaluates `#=(...)`; both
+  now use `clojure.edn/read-string`.
+- `undo-extract!` restored whatever paths a receipt named; receipts from
+  `extract!` and from MCP extraction are now signed with a per-user key at
+  `~/.local/state/clj-surgeon/receipt-key` (owner-only; a key other users can
+  read refuses), and undo refuses an unsigned or altered receipt. Receipts
+  written before this change no longer undo.
+- A `.clj-surgeon.edn` above the workspace no longer applies, and a
+  requested source root that is missing or leaves the workspace refuses.
+- `--receipt-out` on a move could overwrite any file, including the move's
+  target; it now refuses a non-`.edn`, existing, or written path.
+- Workspace walks no longer descend into symlinked directories outside the
+  workspace.
 
 ### Fixed
 

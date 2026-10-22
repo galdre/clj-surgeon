@@ -23,6 +23,7 @@
    [clj-surgeon.move-callers :as move-callers]
    [clj-surgeon.outline :as outline]
    [clj-surgeon.quoted-var-refs :as quoted-var-refs]
+   [clj-surgeon.receipt-mac :as receipt-mac]
    [clj-surgeon.structural-lens :as structural-lens]
    [clojure.edn :as edn]
    [clojure.java.io :as io]
@@ -566,54 +567,67 @@
 (defn with-caller-rewrites
   "Rewrite every caller of the extracted Vars in `sources` {path text} to
   the new namespace, deciding every refusal before any write. Pure: returns
-  the plan with :_callers {path future-text}, :callers-rewritten and
-  :callers-to-review, or a refusal."
-  [{:keys [file to source-ns target-ns moved-vars moved-classes] :as plan} sources]
-  (if (:error plan)
-    plan
-    (let [{:keys [callers problems]}
-          (move-callers/rewrite-callers
-            {:sources sources :exclude [(str file) (str to)]
-             :source-ns source-ns :target-ns target-ns :target-file (str to)
-             :moved moved-vars :moved-classes moved-classes})
-          caller-texts (into {} (map (juxt :file :text)) callers)
-          future-source (when (empty? problems)
-                          (:source (compile-candidates
-                                     {:source (:_source plan)
-                                      :source-file file
-                                      :target-file to
-                                      :form-ranges (:_form-texts plan)
-                                      :target-source (:_new-file-content plan)
-                                      :target-ns target-ns
-                                      :target-alias (:target-alias plan)
-                                      :source-referred-forms (:_source-referred-forms plan)})))
-          graph (when future-source
-                  (into {}
-                        (keep move-callers/ns-requires)
-                        (concat (vals (merge (dissoc sources (str file) (str to)) caller-texts))
-                                [future-source (:_new-file-content plan)])))
-          cycle (some-> graph (move-callers/find-cycle target-ns))
-          refusal {:source-unchanged true :target-unchanged true :files-unchanged true}]
-      (cond
-        (seq problems)
-        (merge refusal
-               {:error "A reference to an extracted form cannot be rewritten exactly"
-                :error-type :caller-not-rewritable
-                :references problems
-                :next-step "Change or remove each listed reference, then extract again"})
+  the plan with :_callers {path future-text}, :callers-proposed and
+  :callers-to-review, or a refusal. The rewrites are proposals: execute!
+  writes them only when the request accepts them. Options as for
+  move-into/compile-move: :caller-authority :model returns unrewritable
+  references as :caller-problems evidence instead of refusing and keeps the
+  proposal out of the cycle check; :max-candidates bounds the scan."
+  ([plan sources] (with-caller-rewrites plan sources {}))
+  ([{:keys [file to source-ns target-ns moved-vars moved-classes] :as plan} sources
+    {:keys [caller-authority max-candidates] :or {caller-authority :kernel}}]
+   (if (:error plan)
+     plan
+     (let [kernel? (= :kernel caller-authority)
+           {:keys [callers problems budget-exceeded]}
+           (move-callers/rewrite-callers
+             {:sources sources :exclude [(str file) (str to)]
+              :source-ns source-ns :target-ns target-ns :target-file (str to)
+              :moved moved-vars :moved-classes moved-classes
+              :max-candidates max-candidates})
+           caller-texts (into {} (map (juxt :file :text)) callers)
+           future-source (when (and (not budget-exceeded) (or (not kernel?) (empty? problems)))
+                           (:source (compile-candidates
+                                      {:source (:_source plan)
+                                       :source-file file
+                                       :target-file to
+                                       :form-ranges (:_form-texts plan)
+                                       :target-source (:_new-file-content plan)
+                                       :target-ns target-ns
+                                       :target-alias (:target-alias plan)
+                                       :source-referred-forms (:_source-referred-forms plan)})))
+           graph (when future-source
+                   (into {}
+                         (keep move-callers/ns-requires)
+                         (concat (vals (merge (dissoc sources (str file) (str to))
+                                              (when kernel? caller-texts)))
+                                 [future-source (:_new-file-content plan)])))
+           cycle (some-> graph (move-callers/find-cycle target-ns))
+           refusal {:source-unchanged true :target-unchanged true :files-unchanged true}]
+       (cond
+         budget-exceeded
+         (merge refusal (move-callers/budget-refusal budget-exceeded))
 
-        cycle
-        (merge refusal
-               {:error "Rewriting the callers would make namespaces require each other"
-                :error-type :circular-require
-                :cycle cycle})
+         (and kernel? (seq problems))
+         (merge refusal
+                {:error "A reference to an extracted form cannot be rewritten exactly"
+                 :error-type :caller-not-rewritable
+                 :references problems
+                 :next-step "Change or remove each listed reference, then extract again"})
 
-        :else
-        (assoc plan
-               :_callers caller-texts
-               :callers-rewritten (move-callers/caller-summary callers)
-               :callers-to-review (mapv :file callers)
-               :caller-warnings (vec (mapcat :warnings callers)))))))
+         cycle
+         (merge refusal
+                {:error "Rewriting the callers would make namespaces require each other"
+                 :error-type :circular-require
+                 :cycle cycle})
+
+         :else
+         (assoc plan
+                :_callers caller-texts
+                :callers-proposed (move-callers/caller-summary callers)
+                :callers-to-review (mapv :file callers)
+                :caller-problems (if kernel? [] (vec problems))
+                :caller-warnings (vec (mapcat :warnings callers))))))))
 
 (defn- relative-to [root path]
   (let [prefix (str root "/")]
@@ -625,7 +639,7 @@
   (let [rel (partial relative-to root)
         file-entry #(cond-> % (:file %) (update :file rel))]
     (cond-> plan
-      (:callers-rewritten plan) (update :callers-rewritten (partial mapv file-entry))
+      (:callers-proposed plan) (update :callers-proposed (partial mapv file-entry))
       (:callers-to-review plan) (update :callers-to-review (partial mapv rel))
       (:caller-warnings plan) (update :caller-warnings (partial mapv file-entry))
       (:references plan) (update :references (partial mapv file-entry)))))
@@ -641,46 +655,51 @@
   [{:keys [file forms to source-paths require-policy public-forms source-roots]
     :or {require-policy :minimal}
     :as opts}]
-  (try
-    (let [source (slurp file)
-          target-ns (file-path->ns-name to source-paths)
-          project-root (.getCanonicalPath (project-root-for-source file source-paths))
-          source-canonical-path (.getCanonicalPath (io/file file))
-          target-canonical-path (.getCanonicalPath (io/file to))
-          workspace-sources
-          (->> (if source-roots
-                 (quoted-var-refs/workspace-files project-root source-roots)
-                 (quoted-var-refs/workspace-files project-root))
-               (remove #(= source-canonical-path (.getPath %)))
-               (map (fn [workspace-file]
-                      [(.getPath workspace-file) (slurp workspace-file)]))
-               (into (sorted-map)))
-          compiled (compile-plan
-                     {:file source-canonical-path
-                      :source source
-                      :forms forms
-                      :to target-canonical-path
-                      :target-ns target-ns
-                      :workspace-sources workspace-sources
-                      :require-policy require-policy
-                      :public-forms (vec public-forms)
-                      :derive-required-public-forms (not (contains? opts :public-forms))})
-          planned (with-caller-rewrites compiled workspace-sources)]
-      (cond-> (relativize-callers planned project-root)
-        (not (:error planned))
-        (assoc :file file
-               :to to
-               :_caller-hashes (into {} (map (fn [[path _]]
-                                               [path (structural-lens/source-hash
-                                                       (get workspace-sources path))]))
-                                     (:_callers planned))
-               :_project-root project-root)))
-    (catch Exception error
-      {:ok false
-       :error-type :extraction-snapshot-failed
-       :error (.getMessage error)
-       :source-unchanged true
-       :target-unchanged true})))
+  (if-let [roots-refusal (move-callers/source-roots-refusal
+                           source-roots
+                           #(quoted-var-refs/unusable-source-roots
+                              (.getCanonicalPath (project-root-for-source file source-paths)) %))]
+    roots-refusal
+    (try
+      (let [source (slurp file)
+            target-ns (file-path->ns-name to source-paths)
+            project-root (.getCanonicalPath (project-root-for-source file source-paths))
+            source-canonical-path (.getCanonicalPath (io/file file))
+            target-canonical-path (.getCanonicalPath (io/file to))
+            workspace-sources
+            (->> (if source-roots
+                   (quoted-var-refs/workspace-files project-root source-roots)
+                   (quoted-var-refs/workspace-files project-root))
+                 (remove #(= source-canonical-path (.getPath %)))
+                 (map (fn [workspace-file]
+                        [(.getPath workspace-file) (slurp workspace-file)]))
+                 (into (sorted-map)))
+            compiled (compile-plan
+                       {:file source-canonical-path
+                        :source source
+                        :forms forms
+                        :to target-canonical-path
+                        :target-ns target-ns
+                        :workspace-sources workspace-sources
+                        :require-policy require-policy
+                        :public-forms (vec public-forms)
+                        :derive-required-public-forms (not (contains? opts :public-forms))})
+            planned (with-caller-rewrites compiled workspace-sources)]
+        (cond-> (relativize-callers planned project-root)
+          (not (:error planned))
+          (assoc :file file
+                 :to to
+                 :_caller-hashes (into {} (map (fn [[path _]]
+                                                 [path (structural-lens/source-hash
+                                                         (get workspace-sources path))]))
+                                       (:_callers planned))
+                 :_project-root project-root)))
+      (catch Exception error
+        {:ok false
+         :error-type :extraction-snapshot-failed
+         :error (.getMessage error)
+         :source-unchanged true
+         :target-unchanged true}))))
 
 ;; ============================================================
 ;; Effects: Execute the extraction
@@ -692,11 +711,22 @@
    source and every rewritten caller are hash-fenced. A failed commit, or a
    new clj-kondo error or unresolved reference in any written file, restores
    the source and the callers and removes the newly-created target."
-  [{:keys [file to receipt-out lint] :or {lint lint-gate/clj-kondo-lint} :as opts}]
-  (let [p (plan opts)]
+  [{:keys [file to receipt-out lint callers] :as opts}]
+  (let [p (plan opts)
+        decision (move-callers/callers-decision callers)
+        ;; clj-kondo runs in the project, with its config and cache.
+        lint (or lint #(lint-gate/clj-kondo-lint % {:dir (:_project-root p)}))]
     (cond
       (:error p)
       p
+
+      (map? decision)
+      decision
+
+      (and (seq (:_callers p)) (not= :accept-proposed decision))
+      (move-callers/decisions-required
+        (:callers-proposed p)
+        "Re-run extract! with --callers accept-proposed to write these rewrites with the extraction, or change those callers first")
 
       (seq (:missing-required-public-forms p))
       {:error "Every moved private form called by remaining source must be public"
@@ -734,13 +764,14 @@
                                              (structural-lens/source-hash (:original %))))
                                  (mapv #(relative-to (:_project-root p) (:path %))))
             receipt-error (receipt-refusal receipt-out source-file target-file)
-            receipt (extraction-receipt
-                      {:source-file source-file
-                       :target-file target-file
-                       :original-source original-source
-                       :future-source updated-source
-                       :target-source new-content
-                       :callers callers})
+            receipt (receipt-mac/sign
+                      (extraction-receipt
+                        {:source-file source-file
+                         :target-file target-file
+                         :original-source original-source
+                         :future-source updated-source
+                         :target-source new-content
+                         :callers callers}))
             existing-files (into [source-file] (map (comp io/file :path)) callers)
             restore! (fn []
                        (let [source-restored?
@@ -808,11 +839,21 @@
                     introduced (when (and (:checked baseline) (:checked after))
                                  (lint-gate/new-blocking-findings (:findings baseline)
                                                                   (:findings after)))]
-                (if (seq introduced)
+                (cond
+                  ;; Checked before the write but not after: the write does not stand.
+                  (and (:checked baseline) (not (:checked after)))
+                  {:error (str "clj-kondo could not check the extraction (" (:reason after)
+                               "); every file was restored")
+                   :error-type :lint-unverified
+                   :restored (every? true? (vals (restore!)))}
+
+                  (seq introduced)
                   {:error "The extraction introduced clj-kondo errors or unresolved references; every file was restored"
                    :error-type :lint-regression
                    :new-errors (vec (take 10 introduced))
                    :restored (every? true? (vals (restore!)))}
+
+                  :else
                   (let [receipt-file (publish-receipt! receipt-out receipt)]
                     (cond->
                       {:file file
@@ -846,7 +887,7 @@
                                   :parsed true
                                   :atomic-write true
                                   :read-back true}
-                       :callers-rewritten (:callers-rewritten p)
+                       :callers-rewritten (:callers-proposed p)
                        :callers-to-review (:callers-to-review p)
                        :warnings (:caller-warnings p)
                        :files-written (+ 2 (count callers))
@@ -891,6 +932,11 @@
           source-file (io/file (:file source))
           target-file (io/file (:file target))]
       (cond
+        ;; An unsigned or altered receipt could overwrite any file, whichever
+        ;; route wrote it.
+        (not (receipt-mac/authentic? receipt-data))
+        (receipt-mac/refusal)
+
         (= :compiled-extraction (:operation receipt-data))
         ((requiring-resolve 'clj-surgeon.mcp-extraction/undo!) receipt-data)
 

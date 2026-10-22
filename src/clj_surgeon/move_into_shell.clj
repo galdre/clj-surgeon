@@ -10,8 +10,10 @@
    [clj-surgeon.file-ops :as file-ops]
    [clj-surgeon.forms :as forms]
    [clj-surgeon.lint-gate :as lint-gate]
+   [clj-surgeon.move-callers :as move-callers]
    [clj-surgeon.move-into :as move-into]
    [clj-surgeon.quoted-var-refs :as quoted-var-refs]
+   [clj-surgeon.receipt-mac :as receipt-mac]
    [clj-surgeon.structural-lens :as structural-lens]
    [clojure.edn :as edn]
    [clojure.java.io :as io]
@@ -35,14 +37,6 @@
                  (filter #(.exists (io/file % "deps.edn")))
                  first)
         (.getParentFile canonical))))
-
-(defn- invalid-source-roots
-  "The --source-roots entries that are not relative paths inside the workspace."
-  [roots]
-  (vec (remove #(and (string? %)
-                     (not (.isAbsolute (io/file %)))
-                     (not-any? #{".."} (str/split % #"[/\\]")))
-               roots)))
 
 (defn- workspace-sources
   "Every Clojure file under the workspace's declared source roots, or under
@@ -88,16 +82,11 @@
   every future text and the hash of every file it read them from."
   [{:keys [file to forms source-roots] :as opts}]
   (let [target-file (io/file to)
-        bad-roots (some-> source-roots invalid-source-roots not-empty)]
+        roots-refusal (move-callers/source-roots-refusal
+                        source-roots
+                        #(quoted-var-refs/unusable-source-roots (str (workspace-root file)) %))]
     (cond
-      bad-roots
-      {:ok false
-       :error-type :invalid-source-roots
-       :error "--source-roots takes paths relative to the workspace, inside it"
-       :source-roots bad-roots
-       :source-unchanged true
-       :target-unchanged true
-       :files-unchanged true}
+      roots-refusal roots-refusal
 
       (not (.exists target-file))
       {:ok false
@@ -109,33 +98,50 @@
        :target-unchanged true
        :files-unchanged true}
 
+      (= (canonical-path file) (canonical-path to))
+      {:ok false
+       :error-type :extraction-path-collision
+       :error "--file and --to name the same file"
+       :source-unchanged true
+       :target-unchanged true
+       :files-unchanged true}
+
       :else
       (let [source-file (canonical-path file)
             target-path (canonical-path to)
-            sources (merge (workspace-sources file source-roots)
-                           {source-file (slurp source-file) target-path (slurp target-path)})
-            result (move-into/compile-move
-                     (cond-> {:source-file source-file
-                              :source (get sources source-file)
-                              :target-file target-path
-                              :target (get sources target-path)
-                              :target-ns (target-namespace (get sources target-path))
-                              :forms forms
-                              :anchor (select-keys opts anchor-option-keys)
-                              :project-aliases (forms/load-project-aliases to)
-                              :workspace-sources sources}
-                       (contains? opts :public-forms)
-                       (assoc :public-forms (:public-forms opts))))]
-        (if-not (:ok result)
-          (relativize result (workspace-root file))
-          (let [result (-> result
-                           (relativize (workspace-root file))
-                           (assoc :source-file source-file :target-file target-path
-                                  :workspace-root (str (workspace-root file))))]
-            (assoc result :snapshot
-                   (into (sorted-map)
-                         (map (fn [path] [path (structural-lens/source-hash (get sources path))]))
-                         (keys (future-files result))))))))))
+            [scanned scan-error] (try [(workspace-sources file source-roots) nil]
+                                      (catch Exception error [nil (.getMessage error)]))]
+        (if scan-error
+          {:ok false
+           :error-type :workspace-scan-failed
+           :error (str "The workspace's source roots could not be read: " scan-error)
+           :source-unchanged true
+           :target-unchanged true
+           :files-unchanged true}
+          (let [sources (merge scanned
+                          {source-file (slurp source-file) target-path (slurp target-path)})
+                result (move-into/compile-move
+                         (cond-> {:source-file source-file
+                                  :source (get sources source-file)
+                                  :target-file target-path
+                                  :target (get sources target-path)
+                                  :target-ns (target-namespace (get sources target-path))
+                                  :forms forms
+                                  :anchor (select-keys opts anchor-option-keys)
+                                  :project-aliases (forms/load-project-aliases to (str (workspace-root file)))
+                                  :workspace-sources sources}
+                           (contains? opts :public-forms)
+                           (assoc :public-forms (:public-forms opts))))]
+            (if-not (:ok result)
+              (relativize result (workspace-root file))
+              (let [result (-> result
+                               (relativize (workspace-root file))
+                               (assoc :source-file source-file :target-file target-path
+                                      :workspace-root (str (workspace-root file))))]
+                (assoc result :snapshot
+                       (into (sorted-map)
+                             (map (fn [path] [path (structural-lens/source-hash (get sources path))]))
+                             (keys (future-files result))))))))))))
 
 (defn- summary [result]
   (select-keys result [:moved-forms :public-forms :declared :requires-added :requires-removed
@@ -143,16 +149,39 @@
                        :callers-rewritten :callers-to-review]))
 
 (defn plan-summary
-  "The plan as the CLI prints it: no file contents."
+  "The plan as the CLI prints it: no file contents. Rewrites of callers in
+  other files are proposals until extract! accepts them."
   [opts]
   (let [result (plan opts)]
     (if (:ok result)
-      (assoc (summary result) :ok true :file (:file opts) :to (:to opts))
+      (-> (summary result)
+          (dissoc :callers-rewritten)
+          (assoc :ok true :file (:file opts) :to (:to opts)
+                 :callers-proposed (:callers-rewritten result)))
       (dissoc result :source :target :callers))))
 
 ;; ============================================================
 ;; Apply, receipt, undo
 ;; ============================================================
+
+(defn- receipt-refusal
+  "Refuse a receipt path that is not a new .edn file, or that names a file
+  the move writes."
+  [receipt-out paths]
+  (when receipt-out
+    (let [receipt-path (.getCanonicalPath (io/file receipt-out))
+          refusal (fn [error-type error]
+                    {:ok false :error-type error-type :error error :receipt-out receipt-out
+                     :source-unchanged true :target-unchanged true :files-unchanged true})]
+      (cond
+        (contains? (set (map #(.getCanonicalPath (io/file %)) paths)) receipt-path)
+        (refusal :extraction-receipt-alias "The receipt path names a file the move writes")
+
+        (not (str/ends-with? receipt-path ".edn"))
+        (refusal :invalid-extraction-receipt-path "The receipt path must end in .edn")
+
+        (.exists (io/file receipt-path))
+        (refusal :extraction-receipt-exists "The receipt file already exists")))))
 
 (defn- write-receipt! [receipt-out entries]
   (when receipt-out
@@ -162,8 +191,9 @@
                                    :original original
                                    :result-hash (structural-lens/source-hash result)})
                                 entries)}]
-      (spit receipt-out (pr-str receipt))
-      receipt-out)))
+      (.mkdirs (.getParentFile (.getAbsoluteFile (io/file receipt-out))))
+      (file-ops/atomic-write! (io/file receipt-out) (pr-str (receipt-mac/sign receipt)))
+      (.getCanonicalPath (io/file receipt-out)))))
 
 (defn- restore! [entries]
   (doseq [{:keys [path original]} entries]
@@ -173,56 +203,83 @@
 (defn apply-plan!
   "Write a plan from `plan`. Every file must still match the hash it was
   planned from. A new clj-kondo error in any written file restores them all."
-  [{:keys [file to receipt-out lint] :or {lint lint-gate/clj-kondo-lint}} result]
-  (if-not (:ok result)
-    (dissoc result :source :target :callers)
-    (let [entries (mapv (fn [[path text]]
-                          {:path path :original (slurp path) :result text})
-                        (future-files result))
-          changed (->> entries
-                       (remove #(= (get-in result [:snapshot (:path %)])
-                                   (structural-lens/source-hash (:original %))))
-                       (mapv :path))]
-      (if (seq changed)
-        {:ok false
-         :error-type :stale-source
-         :error "A file changed after planning; nothing was written"
-         :changed (mapv (partial relative-to (:workspace-root result)) changed)
-         :source-unchanged true
-         :target-unchanged true
-         :files-unchanged true}
-        (let [files (mapv (comp io/file :path) entries)
-              baseline (lint files)]
-          (try
-            (doseq [{:keys [path result]} entries]
-              (file-ops/atomic-write! (io/file path) result))
-            (when-not (every? #(= (:result %) (slurp (:path %))) entries)
-              (throw (ex-info "Read-back verification failed"
-                              {:error-type :move-read-back-failed})))
-            (let [after (if (:checked baseline) (lint files) baseline)
-                  introduced (when (and (:checked baseline) (:checked after))
-                               (lint-gate/new-blocking-findings (:findings baseline) (:findings after)))]
-              (if (seq introduced)
+  [{:keys [file to receipt-out lint callers]} result]
+  (let [decision (move-callers/callers-decision callers)
+        ;; clj-kondo runs in the workspace, with its config and cache.
+        lint (or lint #(lint-gate/clj-kondo-lint % {:dir (:workspace-root result)}))]
+    (cond
+      (not (:ok result))
+      (dissoc result :source :target :callers)
+
+      (map? decision) decision
+
+      (receipt-refusal receipt-out (keys (future-files result)))
+      (receipt-refusal receipt-out (keys (future-files result)))
+
+      (and (seq (:callers result)) (not= :accept-proposed decision))
+      (move-callers/decisions-required
+        (:callers-rewritten result)
+        "Re-run extract! with --callers accept-proposed to write these rewrites with the move, or change those callers first")
+
+      :else
+      (let [entries (mapv (fn [[path text]]
+                            {:path path :original (slurp path) :result text})
+                          (future-files result))
+            changed (->> entries
+                         (remove #(= (get-in result [:snapshot (:path %)])
+                                     (structural-lens/source-hash (:original %))))
+                         (mapv :path))]
+        (if (seq changed)
+          {:ok false
+           :error-type :stale-source
+           :error "A file changed after planning; nothing was written"
+           :changed (mapv (partial relative-to (:workspace-root result)) changed)
+           :source-unchanged true
+           :target-unchanged true
+           :files-unchanged true}
+          (let [files (mapv (comp io/file :path) entries)
+                baseline (lint files)]
+            (try
+              (doseq [{:keys [path result]} entries]
+                (file-ops/atomic-write! (io/file path) result))
+              (when-not (every? #(= (:result %) (slurp (:path %))) entries)
+                (throw (ex-info "Read-back verification failed"
+                                {:error-type :move-read-back-failed})))
+              (let [after (if (:checked baseline) (lint files) baseline)
+                    introduced (when (and (:checked baseline) (:checked after))
+                                 (lint-gate/new-blocking-findings (:findings baseline) (:findings after)))]
+                (cond
+                  ;; The files were checked before the write; a check that cannot
+                  ;; finish after it proves nothing, so the write does not stand.
+                  (and (:checked baseline) (not (:checked after)))
+                  {:ok false
+                   :error-type :lint-unverified
+                   :error (str "clj-kondo could not check the move (" (:reason after) "); every file was restored")
+                   :restored (restore! entries)}
+
+                  (seq introduced)
+                  {:ok false
+                   :error-type :lint-regression
+                   :error "The move introduced clj-kondo errors or unresolved references; every file was restored"
+                   :new-errors (vec (take 10 introduced))
+                   :restored (restore! entries)}
+
+                  :else
+                  (cond-> (assoc (summary result)
+                                 :ok true
+                                 :applied true
+                                 :file file
+                                 :to to
+                                 :files-written (count entries)
+                                 :lint (if (:checked after)
+                                         {:checked true :files (count files) :new-errors 0}
+                                         {:checked false :reason (:reason after)}))
+                    receipt-out (assoc :receipt-file (write-receipt! receipt-out entries)))))
+              (catch Exception error
                 {:ok false
-                 :error-type :lint-regression
-                 :error "The move introduced clj-kondo errors or unresolved references; every file was restored"
-                 :new-errors (vec (take 10 introduced))
-                 :restored (restore! entries)}
-                (cond-> (assoc (summary result)
-                               :ok true
-                               :applied true
-                               :file file
-                               :to to
-                               :files-written (count entries)
-                               :lint (if (:checked after)
-                                       {:checked true :files (count files) :new-errors 0}
-                                       {:checked false :reason (:reason after)}))
-                  receipt-out (assoc :receipt-file (write-receipt! receipt-out entries)))))
-            (catch Exception error
-              {:ok false
-               :error-type (or (:error-type (ex-data error)) :move-write-failed)
-               :error (.getMessage error)
-               :restored (restore! entries)})))))))
+                 :error-type (or (:error-type (ex-data error)) :move-write-failed)
+                 :error (.getMessage error)
+                 :restored (restore! entries)}))))))))
 
 (defn execute!
   "Plan and apply a move into an existing namespace. Refusals leave every
@@ -235,8 +292,14 @@
   move's result. Other receipts go to the extraction undo."
   [{:keys [receipt] :as opts}]
   (let [data (try (edn/read-string (slurp receipt)) (catch Exception _ nil))]
-    (if-not (= :move-into (:kind data))
+    (cond
+      (not (= :move-into (:kind data)))
       (extract/undo! opts)
+
+      (not (receipt-mac/authentic? data))
+      (receipt-mac/refusal)
+
+      :else
       (let [changed (->> (:files data)
                          (remove #(= (:result-hash %)
                                      (structural-lens/source-hash (slurp (:path %)))))

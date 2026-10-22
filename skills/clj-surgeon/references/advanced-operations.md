@@ -56,7 +56,7 @@ clj-surgeon extract --file src/billing/invoice.clj --forms '[has-email?]' \
   --to src/billing/customer.clj --into-existing --below email
 clj-surgeon extract! --file src/billing/invoice.clj --forms '[has-email?]' \
   --to src/billing/customer.clj --into-existing --below email \
-  --receipt-out /tmp/move.edn
+  --callers accept-proposed --receipt-out /tmp/move.edn
 clj-surgeon undo-extract! --receipt /tmp/move.edn
 ```
 
@@ -72,7 +72,10 @@ ambiguous anchor (use a typed one such as `'defmethod render :card'`), a name
 the target already defines, a plain symbol that would mean something else in
 the target, a moved form that calls one left behind (move the suggested set
 together), an alias conflict, a reference it cannot rewrite exactly, or a
-circular require. Callers in other files are rewritten in the same move:
+circular require. Callers in other files are proposed, and rewritten in the
+same move only with `--callers accept-proposed`; without it, `extract!`
+refuses with `:extraction-decisions-required` and the proposal, and changes
+nothing. The rules:
 `inv/has-email?` takes the caller's alias for the target (one is added when
 missing), `billing.invoice/has-email?` and `#'billing.invoice/has-email?`
 keep their fully qualified spelling, and a referred name moves to a `:refer`
@@ -96,15 +99,18 @@ placed above a target form they call, and rewritten alias-qualified quoted
 symbols (`'inv/has-email?`), which resolve through whatever namespace is
 current at run time.
 
-Both forms of `extract!` rewrite callers in other files the same way, and
-report them under `callers-rewritten` and `callers-to-review`; a caller that
+Both forms of `extract!` propose callers in other files the same way (the
+dry run's `callers-proposed`) and write them only with
+`--callers accept-proposed`, reporting `callers-rewritten` and
+`callers-to-review`; a caller that
 cannot be rewritten exactly, or a rewrite that closes a require cycle,
 refuses before any write. The dry run also reports authority-labeled
 `quoted-var-references` for exact `#'name` and `(var name)` callers that
 semantic indexes can omit. Execution parses and hash-verifies every future
 file before it publishes the receipt, and a new clj-kondo error or unresolved
-reference in any written file restores them all. The inverse refuses if any
-result drifted. After execution, compile and test.
+reference in any written file restores them all. Receipts are signed with a
+per-user key; undo refuses a receipt that is unsigned, altered, or whose
+results drifted. After execution, compile and test.
 
 When a namespace contains or gains `(declare ...)`, inspect first, then apply:
 

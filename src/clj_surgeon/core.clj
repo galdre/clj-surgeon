@@ -253,7 +253,7 @@
   [build-file]
   (try
     (source-paths-from-config (str (fs/file-name build-file))
-                              (read-string (slurp (str build-file))))
+                              (edn/read-string (slurp (str build-file))))
     (catch Exception _e ["src"])))
 
 ;; @spec MCP-OP-SHELL-ARGV-003
@@ -685,14 +685,15 @@
                                    :public-forms   {:desc "EDN vector of moved private forms to make public. Omit it to publicize every moved private form that remaining source still calls; a list that omits one refuses"}
                                    :source-roots   {:desc "EDN vector of workspace-relative directories to scan for callers, e.g. '[\"src\" \"test\"]'. Default: the roots deps.edn and bb.edn declare, plus src, test and dev"}
                                    :require-policy {:desc ":minimal (default) proves exact requires; :copy-all preserves the complete source ns header as a conservative starting point"}
-                                   :receipt-out    {:desc "Optional new .edn path for a guarded inverse receipt"}}
+                                   :receipt-out    {:desc "Optional new .edn path for a guarded inverse receipt"}
+                                   :callers        {:desc "accept-proposed to write the exact caller rewrites the dry run proposes (:callers-proposed) in the same write. Without it, a move or extraction with callers in other files refuses and changes nothing"}}
                        :workflow  ["Run :extract first. Review target-requires, omitted-target-requires, remaining-source-callers, callers-to-review, and authority-labeled quoted-var-references. Unsupported require shapes refuse instead of copying or dropping unproved dependencies."
-                                   "Application compiles every complete file from one snapshot, parses them, hash-fences the source and every caller, writes atomically, and verifies read-back. Callers in other files are rewritten to the new namespace in the same write; a reference that cannot be rewritten exactly refuses with :caller-not-rewritable before any write. A new clj-kondo error or unresolved reference in any written file restores them all."
+                                   "Application compiles every complete file from one snapshot, parses them, hash-fences the source and every caller, writes atomically, and verifies read-back. Callers in other files are proposed, not rewritten: the dry run lists them under :callers-proposed, and extract! writes them in the same write only with --callers accept-proposed; without it, extract! refuses with :extraction-decisions-required and changes nothing. A reference that cannot be rewritten exactly refuses with :caller-not-rewritable before any write. A new clj-kondo error or unresolved reference in any written file restores them all."
                                    "Existing targets, stale source, invalid candidates, receipt aliases, and handled write failures refuse or roll back without leaving a partial extraction."
                                    "Use :receipt-out when the extraction must be reversible. Pass that path to :undo-extract!; do not edit the receipt."
-                                   "With --into-existing, name exactly one of --above FORM, --below FORM, --at-start, --at-end. Callers in other files are rewritten: aliased and fully qualified references and var quotes move to the target, referred names move to the target libspec, and requires are added or removed to match. The plan refuses name clashes, symbols that would mean something else in the target, forms left behind that the moved forms call, alias conflicts, references it cannot rewrite exactly (:caller-not-rewritable) and circular requires before any write. Every file is hash-fenced; a new clj-kondo error in any written file restores them all."]
+                                   "With --into-existing, name exactly one of --above FORM, --below FORM, --at-start, --at-end. Callers in other files are proposed the same way and written only with --callers accept-proposed: aliased and fully qualified references and var quotes move to the target, referred names move to the target libspec, and requires are added or removed to match. The plan refuses name clashes, symbols that would mean something else in the target, forms left behind that the moved forms call, alias conflicts, references it cannot rewrite exactly (:caller-not-rewritable) and circular requires before any write. Every file is hash-fenced; a new clj-kondo error in any written file restores them all."]
                        :examples  ["clj-surgeon :op :extract! :file src/state.clj :forms '[distill refine]' :to src/distillery.clj :receipt-out /tmp/distillery-extract.edn"
-                                   "clj-surgeon extract! --file src/billing/invoice.clj --forms '[has-email?]' --to src/billing/customer.clj --into-existing --below email --receipt-out /tmp/move.edn"]
+                                   "clj-surgeon extract! --file src/billing/invoice.clj --forms '[has-email?]' --to src/billing/customer.clj --into-existing --below email --callers accept-proposed --receipt-out /tmp/move.edn"]
                        :category  :write
                        :pair      :extract}
 
@@ -1316,8 +1317,9 @@
     (= s "true") true
     (= s "false") false
     (.startsWith s ":") (keyword (subs s 1))
-    (.startsWith s "[") (read-string s)  ;; parse EDN vectors after shell unquoting
-    (.startsWith s "{") (read-string s)  ;; parse EDN maps
+    ;; clojure.edn, never clojure.core/read-string: #=(...) must not evaluate.
+    (.startsWith s "[") (edn/read-string s)  ;; parse EDN vectors after shell unquoting
+    (.startsWith s "{") (edn/read-string s)  ;; parse EDN maps
     :else s))
 
 (defn- gnu-flag? [s]

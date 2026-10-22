@@ -471,3 +471,30 @@
       (let [r (move source "(ns app.target\n  (:refer-clojure :exclude [update]))\n"
                     '[update] {:at-end true})]
         (is (:ok r))))))
+
+;; ============================================================
+;; Caller authority and the scan bound (MCP route)
+;; ============================================================
+
+(def ^:private runtime-caller
+  {"src/app/a.clj" "(ns app.a)\n\n(defn g []\n  (require 'app.source)\n  ((resolve 'app.source/f)))\n"
+   "src/app/b.clj" "(ns app.b\n  (:require [app.source :as s]))\n\n(defn h [] (s/f))\n"})
+
+(deftest a-model-deciding-its-callers-gets-the-proposal-as-evidence
+  (let [r (move "(ns app.source)\n\n(defn f [] 1)\n" "(ns app.target)\n" '[f] {:at-end true}
+                :workspace-sources runtime-caller
+                :caller-authority :model)]
+    (is (:ok r))
+    (is (= ["src/app/b.clj"] (keys (:callers r))))
+    (is (= [:runtime-require] (mapv :reason (:caller-problems r))))
+    (testing "the kernel's authority refuses the same request"
+      (is (= :caller-not-rewritable
+             (:error-type (move "(ns app.source)\n\n(defn f [] 1)\n" "(ns app.target)\n" '[f]
+                                {:at-end true} :workspace-sources runtime-caller)))))))
+
+(deftest a-caller-scan-over-its-bound-refuses-before-parsing
+  (let [r (move "(ns app.source)\n\n(defn f [] 1)\n" "(ns app.target)\n" '[f] {:at-end true}
+                :workspace-sources (assoc runtime-caller "src/app/c.clj" "(ns app.c (:require [app.source]))\n(app.source/f\n")
+                :max-candidates 2)]
+    (is (= :caller-scan-budget-exceeded (:error-type r)))
+    (is (= 3 (:candidates r)))))
