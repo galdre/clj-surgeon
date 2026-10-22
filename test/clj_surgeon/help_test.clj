@@ -61,6 +61,58 @@
     (is (= :ls-tree (core/resolve-op (:op (core/parse-args [":op" "ls-tree"])))))
     (is (= :ls-tree (core/resolve-op (:op (core/parse-args [":op" ":ls-tree"])))))))
 
+;; Field request (2026-10-21, a long-time user): "please make it take args
+;; like a normal cli tool: --namespace my.thing --function foo, not
+;; :namespace my.thing :function foo". GNU-style arguments are accepted
+;; alongside the original keyword style, which keeps working unchanged.
+(deftest parse-args-accepts-gnu-style-arguments
+  (testing "--key value is the same as :key value"
+    (is (= (core/parse-args [":op" ":ls" ":file" "src/a.clj"])
+           (core/parse-args ["--op" "ls" "--file" "src/a.clj"])
+           (core/parse-args ["--op" ":ls" "--file" "src/a.clj"]))))
+  (testing "--key=value splits at the first ="
+    (is (= {:op :ls :file "src/a=b.clj"}
+           (core/parse-args ["--op=ls" "--file=src/a=b.clj"]))))
+  (testing "a leading bare word is the operation"
+    (is (= {:op :ls :file "src/a.clj"}
+           (core/parse-args ["ls" "--file" "src/a.clj"])))
+    (is (= :ls-tree (core/resolve-op (:op (core/parse-args ["ls-tree"])))))
+    (is (= :extract! (core/resolve-op (:op (core/parse-args ["extract!"]))))))
+  (testing "a --flag with no value is true"
+    (is (= {:op :mv :file "a.clj" :dry-run true}
+           (core/parse-args ["mv" "--file" "a.clj" "--dry-run"])))
+    (is (= {:op :mv :dry-run true :file "a.clj"}
+           (core/parse-args ["mv" "--dry-run" "--file" "a.clj"]))))
+  (testing "values keep their parsing, including verbatim keys"
+    (is (= '[deliver! has-email?]
+           (:forms (core/parse-args ["extract" "--forms" "[deliver! has-email?]"]))))
+    (is (= :minimal
+           (:require-policy (core/parse-args ["extract" "--require-policy" ":minimal"]))))
+    (is (= "(-> (form 'f) (match :x))"
+           (:expr (core/parse-args ["xray" "--expr" "(-> (form 'f) (match :x))"])))))
+  (testing "styles can be mixed and help flags still work"
+    (is (= {:op :cat :file "a.clj" :form "f"}
+           (core/parse-args [":op" ":cat" "--file" "a.clj" ":form" "f"])))
+    (is (= {:op :ls :help true}
+           (core/parse-args ["ls" "--help"]))))
+  (testing "malformed arguments still refuse"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"key-value pairs"
+          (core/parse-args [":op" ":ls" ":file"])))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"key-value pairs"
+          (core/parse-args ["ls" "stray"])))))
+
+(deftest parse-args-keyword-style-is-unchanged
+  (is (= {:op :ls :file "src/a.clj"}
+         (core/parse-args [":op" ":ls" ":file" "src/a.clj"])))
+  (is (= {:op "ls-tree" :dir "src"}
+         (core/parse-args [":op" "ls-tree" ":dir" "src"])))
+  (testing "a keyword-style value that starts with -- stays a value"
+    (is (= {:op :cat :file "a.clj" :contains "--verbose"}
+           (core/parse-args [":op" ":cat" ":file" "a.clj" ":contains" "--verbose"]))))
+  (testing "a GNU-style value can start with -- through --key=value"
+    (is (= "--verbose"
+           (:contains (core/parse-args ["cat" "--contains=--verbose"]))))))
+
 (deftest dispatch-string-op-ls-tree-documented-usage
   (testing "parse-args -> resolve-op -> run accepts the documented bare string op"
     (let [opts (core/parse-args [":op" "ls-tree" ":dir" "src"])]
@@ -323,7 +375,7 @@
     (is (str/includes? apply-help "parses them, hash-fences the source"))
     (is (str/includes? apply-help "roll back"))
     (is (str/includes? apply-help ":undo-extract!"))
-    (is (str/includes? undo-help "both result files still match"))
+    (is (str/includes? undo-help "every result file still matches"))
     (is (str/includes? undo-help "refuses before writing"))))
 
 ;; ============================================================

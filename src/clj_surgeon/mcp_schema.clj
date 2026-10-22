@@ -458,7 +458,28 @@
      {"file" {:type "string" :minLength 1
               :description "Existing project-relative source namespace."}
       "to" {:type "string" :minLength 1
-            :description "Absent project-relative destination namespace."}
+            :description "Project-relative destination namespace: absent, or existing with into_existing."}
+      "into_existing"
+      {:type "boolean"
+       :description "true moves the forms into the existing namespace file at to. Name exactly one anchor: above, below, at_start, or at_end. require_policy has no effect; the move merges the destination's own requires."}
+      "above" {:type "string" :minLength 1
+               :description "With into_existing: place the forms above this destination form, e.g. \"email\" or \"defmethod render :card\"."}
+      "below" {:type "string" :minLength 1
+               :description "With into_existing: place the forms below this destination form."}
+      "at_start" {:type "boolean" :enum [true]
+                  :description "With into_existing: place the forms directly after the destination's ns form."}
+      "at_end" {:type "boolean" :enum [true]
+                :description "With into_existing: place the forms after the destination's last form."}
+      "callers"
+      {:type "string" :enum ["accept-proposed"]
+       :description "accept-proposed writes the exact caller rewrites clj-surgeon proposes (aliased and qualified references, var quotes, referred names, and their requires) in the same transaction. A refusal for missing caller decisions lists the proposal. Do not combine with caller_changes or ignored_caller_files."}
+      "callers_proposal_hash"
+      {:type "string" :pattern "^[0-9a-f]{64}$"
+       :description "Optional, with callers accept-proposed: the callers_proposal_hash a plan or refusal returned. The request refuses if the proposal changed since."}
+      "source_roots"
+      {:type "array" :uniqueItems true
+       :description "Workspace-relative directories to scan for callers instead of the declared source roots."
+       :items {:type "string" :minLength 1}}
       "forms" {:type "array" :minItems 1 :uniqueItems true
                :items {:type "string" :minLength 1}}
       "public_forms"

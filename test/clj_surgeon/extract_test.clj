@@ -9,7 +9,10 @@
    [rewrite-clj.parser :as parser]))
 
 (defn- create-temp-project!
-  "Create a minimal project with a monolith file."
+  "Create a minimal project with a monolith file. distill does not call
+  helper: extracting [distill refine] then leaves a valid program, which the
+  extraction's clj-kondo gate requires. (It once called helper, and every
+  extraction of these tests wrote a target with an unresolved symbol.)"
   []
   (let [root (java.io.File/createTempFile "extract-test" "")
         _ (.delete root)
@@ -27,7 +30,7 @@
 
 ;; Distillery functions
 (defn distill [x]
-  (helper x))
+  (keyword x))
 
 (defn refine [x]
   (distill (str x \"-refined\")))
@@ -410,6 +413,153 @@
         (is (= original-target (slurp target))))
       (finally (delete-recursive! root)))))
 
+;; Field failure (2026-10-21, invoice refactoring trial): `:extract!` moved a
+;; private `defn-` that the source still called. The new file kept `defn-`,
+;; so the source's call failed clj-kondo with "is private". The plan had
+;; already reported `:missing-required-public-forms`; the CLI executor wrote
+;; anyway. The MCP route derives the required public forms by default and
+;; refuses an explicit list that omits one; the CLI now does the same.
+(defn- create-private-caller-project!
+  "A minimized shape of the trial's billing.invoice namespace."
+  []
+  (let [root (java.io.File/createTempFile "extract-private" "")
+        _ (.delete root)
+        _ (.mkdirs root)
+        src-dir (io/file root "src" "billing")]
+    (.mkdirs src-dir)
+    (spit (io/file root "deps.edn") "{:paths [\"src\"]}\n")
+    (spit (io/file src-dir "invoice.clj")
+          (str "(ns billing.invoice\n"
+               "  (:require [clojure.string :as str]))\n\n"
+               "(defn- has-email? [customer]\n"
+               "  (not (str/blank? (:email customer))))\n\n"
+               "(defn- deliver! [customer]\n"
+               "  (when (has-email? customer)\n"
+               "    [:queued (:email customer)]))\n\n"
+               "(defn process [customer]\n"
+               "  (deliver! customer))\n"))
+    root))
+
+(deftest test-execute-publicizes-a-moved-private-form-that-the-source-still-calls
+  (let [root (create-private-caller-project!)
+        source (io/file root "src" "billing" "invoice.clj")
+        target (io/file root "src" "billing" "delivery.clj")]
+    (try
+      (let [result (extract/execute! {:file (.getPath source)
+                                      :forms '[deliver! has-email?]
+                                      :to (.getPath target)})
+            target-text (slurp target)]
+        (is (nil? (:error result)))
+        (testing "the form the source still calls becomes public"
+          (is (str/includes? target-text "(defn deliver! [customer]")))
+        (testing "a helper called only by moved forms stays private"
+          (is (str/includes? target-text "(defn- has-email? [customer]")))
+        (is (= ["deliver!"] (:public-forms result)))
+        (is (some? (parser/parse-string-all target-text))))
+      (finally (delete-recursive! root)))))
+
+(deftest test-execute-refuses-an-explicit-public-forms-list-that-omits-a-required-form
+  (let [root (create-private-caller-project!)
+        source (io/file root "src" "billing" "invoice.clj")
+        target (io/file root "src" "billing" "delivery.clj")
+        original-source (slurp source)]
+    (try
+      (let [result (extract/execute! {:file (.getPath source)
+                                      :forms '[deliver! has-email?]
+                                      :public-forms '[]
+                                      :to (.getPath target)})]
+        (is (= :required-public-forms-missing (:error-type result)))
+        (is (= ["deliver!"] (:missing-public-forms result)))
+        (is (true? (:source-unchanged result)))
+        (is (true? (:target-unchanged result)))
+        (is (= original-source (slurp source)))
+        (is (not (.exists target))))
+      (finally (delete-recursive! root)))))
+
+;; Field failure (2026-10-21, found while planning moves into existing
+;; namespaces): extracting forms that call each other removed them from the
+;; source but wrote neither to the target, and reported success. The
+;; topological order omitted every form in a dependency cycle, and every form
+;; that depends on one. The same run left `(declare odd-step)` in the source.
+(def ^:private mutual-recursion-source
+  (str "(ns app.core)\n\n"
+       "(declare odd-step later)\n\n"
+       "(defn even-step [n]\n"
+       "  (if (zero? n) true (odd-step (dec n))))\n\n"
+       "(defn odd-step [n]\n"
+       "  (if (zero? n) false (even-step (dec n))))\n\n"
+       "(defn parity [n] (if (even-step n) :even :odd))\n\n"
+       "(defn main [] [(parity 4) (later)])\n\n"
+       "(defn later [] :later)\n"))
+
+(defn- mutual-recursion-plan []
+  (extract/compile-plan {:file "src/app/core.clj"
+                         :source mutual-recursion-source
+                         :forms '[even-step odd-step parity]
+                         :to "src/app/parity.clj"
+                         :target-ns "app.parity"}))
+
+(deftest test-compile-plan-writes-every-form-of-a-dependency-cycle
+  (let [plan (mutual-recursion-plan)
+        target (:_new-file-content plan)
+        index #(str/index-of target %)]
+    (is (nil? (:error plan)))
+    (testing "every selected form reaches the target"
+      (is (index "(defn even-step [n]"))
+      (is (index "(defn odd-step [n]"))
+      (is (index "(defn parity [n]")))
+    (testing "a form used before its definition is declared first"
+      (is (index "(declare odd-step)"))
+      (is (< (index "(declare odd-step)") (index "(defn even-step [n]"))))
+    (testing "the cycle keeps its source order, and its dependent follows it"
+      (is (< (index "(defn even-step [n]")
+             (index "(defn odd-step [n]")
+             (index "(defn parity [n]"))))
+    (is (some? (parser/parse-string-all target)))))
+
+(deftest test-compile-candidates-drops-moved-names-from-source-declares
+  (let [plan (mutual-recursion-plan)
+        {:keys [source]}
+        (extract/compile-candidates
+          {:source mutual-recursion-source
+           :source-file "src/app/core.clj"
+           :target-file "src/app/parity.clj"
+           :form-ranges (:_form-texts plan)
+           :target-source (:_new-file-content plan)
+           :target-ns (:target-ns plan)
+           :target-alias (:target-alias plan)
+           :source-referred-forms (:_source-referred-forms plan)})]
+    (is (str/includes? source "(declare later)"))
+    (is (not (str/includes? source "odd-step")))
+    (is (not (str/includes? source "(defn even-step")))
+    (is (str/includes? source "(defn later [] :later)"))))
+
+(deftest test-compile-candidates-removes-a-declare-that-names-only-moved-forms
+  (let [source (str "(ns app.core)\n\n"
+                    "(declare odd-step)\n\n"
+                    "(defn even-step [n]\n"
+                    "  (if (zero? n) true (odd-step (dec n))))\n\n"
+                    "(defn odd-step [n]\n"
+                    "  (if (zero? n) false (even-step (dec n))))\n\n"
+                    "(defn main [] (even-step 4))\n")
+        plan (extract/compile-plan {:file "src/app/core.clj"
+                                    :source source
+                                    :forms '[even-step odd-step]
+                                    :to "src/app/parity.clj"
+                                    :target-ns "app.parity"})
+        result (:source (extract/compile-candidates
+                          {:source source
+                           :source-file "src/app/core.clj"
+                           :target-file "src/app/parity.clj"
+                           :form-ranges (:_form-texts plan)
+                           :target-source (:_new-file-content plan)
+                           :target-ns (:target-ns plan)
+                           :target-alias (:target-alias plan)
+                           :source-referred-forms (:_source-referred-forms plan)}))]
+    (is (not (str/includes? result "declare")))
+    (is (not (str/includes? result "\n\n\n")))
+    (is (str/includes? result "(defn main [] (even-step 4))"))))
+
 (deftest test-execute-rolls-back-the-created-target-when-source-commit-fails
   (let [root (create-temp-project!)
         source (io/file root "src" "my" "app.clj")
@@ -760,4 +910,219 @@
         (is (= :side-effect-only-require (:reason result)))
         (is (= original (slurp source)))
         (is (not (.exists target))))
+      (finally (delete-recursive! root)))))
+
+;; ============================================================
+;; Callers in other files (decision 9 of
+;; docs/plans/move-into-existing-namespace.md: extract! to a new file rewrites
+;; callers too)
+;; ============================================================
+
+(deftest pure-compile-plan-refers-moved-protocol-methods-the-source-still-calls
+  ;; Eval-side report (2026-10-21): protocol methods. Extracting Shape left
+  ;; main's (area x) unresolved.
+  (let [plan (extract/compile-plan
+               {:file "src/app/source.clj"
+                :source (str "(ns app.source)\n\n"
+                             "(defprotocol Shape\n  (area [this]))\n\n"
+                             "(defn main [x] (area x))\n")
+                :forms '[Shape]
+                :to "src/app/shape.clj"
+                :target-ns "app.shape"})]
+    (is (= ["area"] (:source-referred-forms plan)))
+    (is (= ["Shape" "area"] (:moved-vars plan)))))
+
+(deftest pure-caller-rewrites-for-a-new-namespace
+  (let [source "(ns app.source)\n\n(defn f [] 1)\n\n(defn g [] 2)\n"
+        plan (extract/compile-plan {:file "src/app/source.clj" :source source :forms '[f]
+                                    :to "src/app/fresh.clj" :target-ns "app.fresh"})
+        sources {"src/app/source.clj" source
+                 "src/app/use.clj" "(ns app.use\n  (:require [app.source :as s]))\n\n(defn h [] [(s/f) (s/g)])\n"
+                 "test/app/source_test.clj" "(ns app.source-test\n  (:require [app.source]))\n\n(#'app.source/f)\n"}
+        r (extract/with-caller-rewrites plan sources)]
+    ;; The sorted insert keeps an existing one-line :require layout.
+    (is (= {"src/app/use.clj" (str "(ns app.use\n  (:require [app.fresh :as fresh]\n   [app.source :as s]))\n\n"
+                                   "(defn h [] [(fresh/f) (s/g)])\n")
+            "test/app/source_test.clj" (str "(ns app.source-test\n  (:require [app.fresh]\n   [app.source]))\n\n"
+                                            "(#'app.fresh/f)\n")}
+           (:_callers r)))
+    (is (= ["src/app/use.clj" "test/app/source_test.clj"] (:callers-to-review r)))
+    (is (= [1 1] (mapv :rewritten (:callers-proposed r))))
+    (testing "a caller that cannot be rewritten refuses"
+      (let [r (extract/with-caller-rewrites
+                plan (assoc sources "dev/user.clj" "(ns user)\n\n(defn go [] (require 'app.source) ((resolve 'app.source/f)))\n"))]
+        (is (= :caller-not-rewritable (:error-type r)))
+        (is (= [:runtime-require] (mapv :reason (:references r))))))
+    (testing "a rewrite that would close a require cycle refuses"
+      (let [plan (extract/compile-plan
+                   {:file "src/app/source.clj"
+                    :source "(ns app.source\n  (:require [app.use :as u]))\n\n(defn f [] (u/k))\n"
+                    :forms '[f] :to "src/app/fresh.clj" :target-ns "app.fresh"
+                    :require-policy :minimal})
+            r (extract/with-caller-rewrites
+                plan {"src/app/use.clj" "(ns app.use\n  (:require [app.source :as s]))\n\n(defn k [] 1)\n(defn h [] (s/f))\n"})]
+        (is (= :circular-require (:error-type r)))
+        (is (= ["app.fresh" "app.use" "app.fresh"] (:cycle r)))))))
+
+(defn- create-caller-project!
+  "The temp project with a deps.edn, an aliased caller, and a test that
+  reaches a moved form through a fully qualified var quote."
+  []
+  (let [root (create-temp-project!)]
+    (spit (io/file root "deps.edn") "{:paths [\"src\"] :aliases {:test {:extra-paths [\"test\"]}}}\n")
+    (.mkdirs (io/file root "test" "my"))
+    (spit (io/file root "src" "my" "cli.clj")
+          "(ns my.cli\n  (:require [my.app :as app]))\n\n(defn run [] [(app/distill 1) (app/helper 2)])\n")
+    (spit (io/file root "test" "my" "app_test.clj")
+          "(ns my.app-test\n  (:require\n   [clojure.test :refer [deftest is]]\n   [my.app]))\n\n(deftest refines (is (#'my.app/refine \"x\")))\n")
+    root))
+
+(deftest test-execute-rewrites-callers-and-undo-restores-them
+  (let [root (create-caller-project!)
+        files (mapv #(io/file root %) ["src/my/app.clj" "src/my/cli.clj" "test/my/app_test.clj"])
+        target (io/file root "src" "my" "distillery.clj")
+        receipt (io/file root "extract.edn")
+        before (mapv slurp files)]
+    (try
+      (let [result (extract/execute! {:file (.getPath (first files))
+                                      :forms '[distill refine]
+                                      :to (.getPath target)
+                                      :receipt-out (.getPath receipt)
+                                      :lint (fn [_] {:checked false})
+                                      :callers "accept-proposed"})]
+        (is (str/includes? (slurp (nth files 1)) "[(distillery/distill 1) (app/helper 2)]"))
+        (is (str/includes? (slurp (nth files 2)) "(#'my.distillery/refine \"x\")"))
+        (is (= ["src/my/cli.clj" "test/my/app_test.clj"] (:callers-to-review result)))
+        (is (= 2 (count (:callers-rewritten result))))
+        (testing "undo restores every file and removes the target"
+          (is (true? (:ok (extract/undo! {:receipt (.getPath receipt)}))))
+          (is (= before (mapv slurp files)))
+          (is (not (.exists target)))))
+      (finally (delete-recursive! root)))))
+
+(deftest test-execute-refuses-a-caller-that-changed-after-planning
+  (let [root (create-caller-project!)
+        source (io/file root "src" "my" "app.clj")
+        caller (io/file root "src" "my" "cli.clj")
+        target (io/file root "src" "my" "distillery.clj")
+        before (slurp source)
+        real-plan extract/plan]
+    (try
+      (let [result (with-redefs [extract/plan (fn [opts]
+                                                (let [p (real-plan opts)]
+                                                  (spit caller (str (slurp caller) ";; edited\n"))
+                                                  p))]
+                     (extract/execute! {:file (.getPath source) :forms '[distill refine]
+                                        :to (.getPath target) :lint (fn [_] {:checked false})
+                                        :callers "accept-proposed"}))]
+        (is (= :stale-extraction-source (:error-type result)))
+        (is (= ["src/my/cli.clj"] (:changed result)))
+        (is (= before (slurp source)))
+        (is (not (.exists target))))
+      (finally (delete-recursive! root)))))
+
+(deftest test-execute-lint-regression-restores-every-file
+  (let [root (create-caller-project!)
+        files (mapv #(io/file root %) ["src/my/app.clj" "src/my/cli.clj" "test/my/app_test.clj"])
+        target (io/file root "src" "my" "distillery.clj")
+        before (mapv slurp files)
+        calls (atom 0)
+        lint (fn [_] (if (= 1 (swap! calls inc))
+                       {:checked true :findings []}
+                       {:checked true :findings [{:filename "src/my/cli.clj" :type :unresolved-var
+                                                  :level :warning :message "Unresolved var: x/y"}]}))]
+    (try
+      (let [result (extract/execute! {:file (.getPath (first files)) :forms '[distill refine]
+                                      :to (.getPath target) :lint lint
+                                      :callers "accept-proposed"})]
+        (is (= :lint-regression (:error-type result)))
+        (is (true? (:restored result)))
+        (is (= before (mapv slurp files)))
+        (is (not (.exists target))))
+      (finally (delete-recursive! root)))))
+
+;; Field regression (2026-10-21): extract required lint-gate, which used
+;; babashka.fs and babashka.process. The MCP server's classpath (deps.edn
+;; :deps) has neither, so the server could not load extract and never became
+;; ready. Every namespace the MCP server can reach must load on that classpath.
+(deftest the-mcp-server-classpath-loads-the-extraction-namespaces
+  (let [{:keys [exit err]} (shell/sh "clojure" "-M" "-e"
+                                     (str "(require 'clj-surgeon.extract 'clj-surgeon.lint-gate "
+                                          "'clj-surgeon.move-callers 'clj-surgeon.move-into "
+                                          "'clj-surgeon.receipt-mac)"))]
+    (is (zero? exit) err)))
+
+;; The model chooses caller semantics (docs/high-level-design.md): callers in
+;; other files are proposed, and written only when the request accepts them.
+(deftest test-execute-refuses-proposed-callers-without-a-decision
+  (let [root (create-caller-project!)
+        files (mapv #(io/file root %) ["src/my/app.clj" "src/my/cli.clj" "test/my/app_test.clj"])
+        target (io/file root "src" "my" "distillery.clj")
+        before (mapv slurp files)]
+    (try
+      (let [result (extract/execute! {:file (.getPath (first files)) :forms '[distill refine]
+                                      :to (.getPath target) :lint (fn [_] {:checked false})})]
+        (is (= :extraction-decisions-required (:error-type result)))
+        (is (= ["src/my/cli.clj" "test/my/app_test.clj"] (mapv :file (:callers-proposed result))))
+        (is (str/includes? (:next-step result) "--callers accept-proposed"))
+        (is (= before (mapv slurp files)))
+        (is (not (.exists target))))
+      (finally (delete-recursive! root)))))
+
+;; Fence review 2026-10-21 (F6): new-file extraction did not validate
+;; --source-roots; ["/usr"] proved zero callers and left a caller dangling.
+(deftest test-plan-refuses-source-roots-outside-the-project
+  (let [root (create-caller-project!)]
+    (try
+      (doseq [bad [["/usr"] ["../elsewhere"] [""]]]
+        (is (= :invalid-source-roots
+               (:error-type (extract/plan {:file (str (io/file root "src/my/app.clj"))
+                                           :forms '[distill]
+                                           :to (str (io/file root "src/my/distillery.clj"))
+                                           :source-roots bad})))
+            (pr-str bad)))
+      (finally (delete-recursive! root)))))
+
+;; Fence review 2026-10-21 (F8): a tampered extraction receipt refuses before
+;; writing anything.
+(deftest test-undo-refuses-a-tampered-receipt
+  (let [root (create-caller-project!)
+        source (io/file root "src" "my" "app.clj")
+        target (io/file root "src" "my" "distillery.clj")
+        victim (doto (io/file root "victim.txt") (spit "keep me"))
+        receipt (io/file root "extract.edn")]
+    (try
+      (extract/execute! {:file (.getPath source) :forms '[distill refine] :to (.getPath target)
+                         :receipt-out (.getPath receipt) :lint (fn [_] {:checked false})
+                         :callers "accept-proposed"})
+      (let [cli (.getCanonicalPath (io/file root "src" "my" "cli.clj"))]
+        (spit receipt (str/replace (slurp receipt) cli (.getCanonicalPath victim))))
+      (let [undo (extract/undo! {:receipt (.getPath receipt)})]
+        (is (= :receipt-not-authentic (:error-type undo)))
+        (is (= "keep me" (slurp victim)))
+        (is (.exists target)))
+      (finally (delete-recursive! root)))))
+
+;; Fence re-review 2026-10-22 (F8): a forged :compiled-extraction receipt
+;; reached the MCP undo unsigned and overwrote any file it named.
+(deftest test-undo-refuses-a-forged-compiled-extraction-receipt
+  (let [root (create-caller-project!)
+        victim (doto (io/file root "victim.txt") (spit "keep me"))
+        forged (io/file root "forged.edn")]
+    (try
+      (spit forged (pr-str {:receipt-version 1 :operation :compiled-extraction
+                            :files [{:file (.getCanonicalPath victim) :original-source "pwned"
+                                     :result-source "keep me"}]}))
+      (is (= :receipt-not-authentic (:error-type (extract/undo! {:receipt (.getPath forged)}))))
+      (is (= "keep me" (slurp victim)))
+      (finally (delete-recursive! root)))))
+
+;; Fence re-review 2026-10-22 (N1), new-file extraction.
+(deftest test-plan-refuses-a-missing-source-root
+  (let [root (create-caller-project!)]
+    (try
+      (is (= :invalid-source-roots
+             (:error-type (extract/plan {:file (str (io/file root "src/my/app.clj")) :forms '[distill]
+                                         :to (str (io/file root "src/my/distillery.clj"))
+                                         :source-roots ["nope"]}))))
       (finally (delete-recursive! root)))))

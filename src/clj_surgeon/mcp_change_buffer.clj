@@ -1444,6 +1444,17 @@
           (not ok) (assoc :output output
                           :error-type :invalid-diagnostic-output))))))
 
+(defn diagnostic-findings!
+  "clj-kondo findings for `files`, run through analyzer admission with the
+  cache disabled: {:checked true :findings [...]}, or {:checked false
+  :reason} when the analyzer or its admission is unavailable."
+  [project-root files]
+  (let [check (run-diagnostic-check! project-root ["clj-kondo" "--lint" "{files}"] files)]
+    (if (and (:ok check) (vector? (get-in check [:diagnostics :findings])))
+      {:checked true :findings (get-in check [:diagnostics :findings])}
+      {:checked false
+       :reason (name (or (:error-type check) :clj-kondo-unavailable))})))
+
 (defn capture-verification-baseline!
   "Capture cache-independent diagnostic snapshots before a transaction writes."
   [project-root profile profiles files]

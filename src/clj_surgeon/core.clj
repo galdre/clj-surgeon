@@ -22,6 +22,7 @@
    [clj-surgeon.forward-refs :as fwd]
    [clj-surgeon.intent-transaction :as intent-transaction]
    [clj-surgeon.move :as move]
+   [clj-surgeon.move-into-shell :as move-into-shell]
    [clj-surgeon.outline :as outline]
    [clj-surgeon.rename :as rename]
    [clj-surgeon.show-form :as show-form]
@@ -252,7 +253,7 @@
   [build-file]
   (try
     (source-paths-from-config (str (fs/file-name build-file))
-                              (read-string (slurp (str build-file))))
+                              (edn/read-string (slurp (str build-file))))
     (catch Exception _e ["src"])))
 
 ;; @spec MCP-OP-SHELL-ARGV-003
@@ -646,37 +647,63 @@
                                    "clj-surgeon :op :deps :file src/my/ns.clj :form sync-draft!"]
                        :category  :read}
 
-    :extract          {:handler   extract/plan
+    :extract          {:handler   (fn [opts]
+                                    (if (:into-existing opts)
+                                      (move-into-shell/plan-summary opts)
+                                      ;; Keys starting with _ carry file contents for execute!.
+                                      (into {} (remove #(str/starts-with? (name (key %)) "_"))
+                                            (extract/plan opts))))
                        :desc      "Plan dependency-minimal form extraction with caller and quoted-Var proof (dry run)"
                        :args      {:file           {:required true :desc "Source file"}
                                    :forms          {:required true :desc "EDN vector of form names, e.g. '[foo bar]'"}
                                    :to             {:required true :desc "Target file path for new namespace"}
+                                   :into-existing  {:desc "true to move the forms into a target namespace file that already exists"}
+                                   :above          {:desc "With --into-existing: place the forms above this target form, e.g. email or 'defmethod render :card'"}
+                                   :below          {:desc "With --into-existing: place the forms below this target form"}
+                                   :at-start       {:desc "With --into-existing: place the forms directly after the target's ns form"}
+                                   :at-end         {:desc "With --into-existing: place the forms after the target's last form"}
+                                   :public-forms   {:desc "EDN vector of moved private forms to make public. Omit it to publicize every moved private form that remaining source still calls"}
+                                   :source-roots   {:desc "EDN vector of workspace-relative directories to scan for callers, e.g. '[\"src\" \"test\"]'. Default: the roots deps.edn and bb.edn declare, plus src, test and dev"}
                                    :require-policy {:desc ":minimal (default) proves exact requires; :copy-all preserves the complete source ns header as a conservative starting point"}}
                        :examples  ["clj-surgeon :op :extract :file src/state.clj :forms '[distill refine]' :to src/distillery.clj"]
                        :category  :write
                        :pair      :extract!}
 
-    :extract!         {:handler   extract/execute!
+    :extract!         {:handler   (fn [opts]
+                                    (if (:into-existing opts)
+                                      (move-into-shell/execute! opts)
+                                      (extract/execute! opts)))
                        :desc      "Execute one failure-atomic form extraction to a new namespace"
                        :args      {:file           {:required true :desc "Source file"}
                                    :forms          {:required true :desc "EDN vector of form names"}
-                                   :to             {:required true :desc "New target file; existing files refuse"}
+                                   :to             {:required true :desc "Target file; an existing file refuses unless --into-existing is given"}
+                                   :into-existing  {:desc "true to move the forms into a target namespace file that already exists"}
+                                   :above          {:desc "With --into-existing: place the forms above this target form, e.g. email or 'defmethod render :card'"}
+                                   :below          {:desc "With --into-existing: place the forms below this target form"}
+                                   :at-start       {:desc "With --into-existing: place the forms directly after the target's ns form"}
+                                   :at-end         {:desc "With --into-existing: place the forms after the target's last form"}
+                                   :public-forms   {:desc "EDN vector of moved private forms to make public. Omit it to publicize every moved private form that remaining source still calls; a list that omits one refuses"}
+                                   :source-roots   {:desc "EDN vector of workspace-relative directories to scan for callers, e.g. '[\"src\" \"test\"]'. Default: the roots deps.edn and bb.edn declare, plus src, test and dev"}
                                    :require-policy {:desc ":minimal (default) proves exact requires; :copy-all preserves the complete source ns header as a conservative starting point"}
-                                   :receipt-out    {:desc "Optional new .edn path for a guarded inverse receipt"}}
+                                   :receipt-out    {:desc "Optional new .edn path for a guarded inverse receipt"}
+                                   :callers        {:desc "accept-proposed to write the exact caller rewrites the dry run proposes (:callers-proposed) in the same write. Without it, a move or extraction with callers in other files refuses and changes nothing"}}
                        :workflow  ["Run :extract first. Review target-requires, omitted-target-requires, remaining-source-callers, callers-to-review, and authority-labeled quoted-var-references. Unsupported require shapes refuse instead of copying or dropping unproved dependencies."
-                                   "Application compiles both complete files from one source snapshot, parses them, hash-fences the source, writes atomically, and verifies read-back."
+                                   "Application compiles every complete file from one snapshot, parses them, hash-fences the source and every caller, writes atomically, and verifies read-back. Callers in other files are proposed, not rewritten: the dry run lists them under :callers-proposed, and extract! writes them in the same write only with --callers accept-proposed; without it, extract! refuses with :extraction-decisions-required and changes nothing. A reference that cannot be rewritten exactly refuses with :caller-not-rewritable before any write. A new clj-kondo error or unresolved reference in any written file restores them all."
                                    "Existing targets, stale source, invalid candidates, receipt aliases, and handled write failures refuse or roll back without leaving a partial extraction."
-                                   "Use :receipt-out when the extraction must be reversible. Pass that path to :undo-extract!; do not edit the receipt."]
-                       :examples  ["clj-surgeon :op :extract! :file src/state.clj :forms '[distill refine]' :to src/distillery.clj :receipt-out /tmp/distillery-extract.edn"]
+                                   "Use :receipt-out when the extraction must be reversible. Pass that path to :undo-extract!; do not edit the receipt."
+                                   "With --into-existing, name exactly one of --above FORM, --below FORM, --at-start, --at-end. Callers in other files are proposed the same way and written only with --callers accept-proposed: aliased and fully qualified references and var quotes move to the target, referred names move to the target libspec, and requires are added or removed to match. The plan refuses name clashes, symbols that would mean something else in the target, forms left behind that the moved forms call, alias conflicts, references it cannot rewrite exactly (:caller-not-rewritable) and circular requires before any write. Every file is hash-fenced; a new clj-kondo error in any written file restores them all."]
+                       :examples  ["clj-surgeon :op :extract! :file src/state.clj :forms '[distill refine]' :to src/distillery.clj :receipt-out /tmp/distillery-extract.edn"
+                                   "clj-surgeon extract! --file src/billing/invoice.clj --forms '[has-email?]' --to src/billing/customer.clj --into-existing --below email --callers accept-proposed --receipt-out /tmp/move.edn"]
                        :category  :write
                        :pair      :extract}
 
-    :undo-extract!    {:handler   extract/undo!
-                       :desc      "Undo an extraction while both result files still match its receipt"
+    :undo-extract!    {:handler   move-into-shell/undo!
+                       :desc      "Undo an extraction or a move into an existing namespace while every result file still matches its receipt"
                        :args      {:receipt {:required true :desc "Guarded .edn receipt emitted by :extract!"}}
                        :workflow  ["Supply the unchanged receipt emitted by :extract!."
                                    "The command refuses before writing when either extraction result has changed or disappeared."
-                                   "Success restores the original source and removes only the exact target created by that extraction."]
+                                   "Success restores the original source and removes only the exact target created by that extraction."
+                                   "A receipt from extract! --into-existing restores every file the move wrote, and refuses before writing when any of them has changed."]
                        :examples  ["clj-surgeon :op :undo-extract! :receipt /tmp/distillery-extract.edn"]
                        :category  :write}
 
@@ -1056,7 +1083,8 @@
                               (contains? hidden-from-primary-help op-key)))
                     (group-by (fn [[_ v]] (:category v))))]
     (.append sb "clj-surgeon — structural operations on Clojure namespaces\n\n")
-    (.append sb "Usage: clj-surgeon :op <command> [args...]\n")
+    (.append sb "Usage: clj-surgeon <command> [--arg value | --arg=value | --flag ...]\n")
+    (.append sb "       clj-surgeon :op <command> [:arg value ...]   original style; still accepted\n")
     (.append sb "       clj-surgeon up [WORKSPACE]      join the shared hot MCP stack\n")
     (.append sb "       clj-surgeon recover [WORKSPACE] repair once; receipt names fallback\n")
     (.append sb "       clj-surgeon report-failure --receipt PATH\n")
@@ -1289,17 +1317,67 @@
     (= s "true") true
     (= s "false") false
     (.startsWith s ":") (keyword (subs s 1))
-    (.startsWith s "[") (read-string s)  ;; parse EDN vectors after shell unquoting
-    (.startsWith s "{") (read-string s)  ;; parse EDN maps
+    ;; clojure.edn, never clojure.core/read-string: #=(...) must not evaluate.
+    (.startsWith s "[") (edn/read-string s)  ;; parse EDN vectors after shell unquoting
+    (.startsWith s "{") (edn/read-string s)  ;; parse EDN maps
     :else s))
 
+(defn- gnu-flag? [s]
+  (and (string? s) (str/starts-with? s "--") (> (count s) 2)))
+
+(defn normalize-args
+  "Rewrite GNU-style CLI arguments into the original keyword style, so both
+  are accepted. Pure: string sequence in, string vector out.
+
+  - `--key value` and `--key=value` become `:key value`.
+  - A `--key` followed by nothing or by another `--key` becomes `:key true`.
+  - A leading word with no `:` or `-` prefix is the operation: `ls ...`
+    becomes `:op :ls ...`. A `--op` value without `:` is made a keyword too.
+  - Keyword-style arguments pass through unchanged, so the styles can mix.
+    A keyword-style key takes the next argument verbatim, even one that
+    starts with `--`. In GNU style, write such a value as `--key=--value`."
+  [args]
+  (let [args (vec args)
+        args (if (and (seq args)
+                      (not (str/starts-with? (first args) ":"))
+                      (not (str/starts-with? (first args) "-")))
+               (into [":op" (str ":" (first args))] (rest args))
+               args)
+        op-value (fn [k v]
+                   (if (and (= ":op" k) (not (str/starts-with? v ":")))
+                     (str ":" v)
+                     v))]
+    (loop [[arg & more] args
+           out []]
+      (cond
+        (nil? arg) out
+
+        (and (gnu-flag? arg) (str/includes? arg "="))
+        (let [[k v] (str/split (subs arg 2) #"=" 2)
+              k (str ":" k)]
+          (recur more (conj out k (op-value k v))))
+
+        (gnu-flag? arg)
+        (let [k (str ":" (subs arg 2))
+              [next-arg & after] more]
+          (if (or (nil? next-arg) (gnu-flag? next-arg))
+            (recur more (conj out k "true"))
+            (recur after (conj out k (op-value k next-arg)))))
+
+        ;; A keyword-style key takes the next argument verbatim as its value.
+        (and (str/starts-with? arg ":") (seq more))
+        (recur (rest more) (conj out arg (first more)))
+
+        :else (recur more (conj out arg))))))
+
 (defn parse-args
-  "Parse CLI arg strings into an opts map.
+  "Parse CLI arg strings into an opts map. Accepts both `:key value` and
+   GNU-style `--key value` arguments (see normalize-args).
    Pure: string sequence in, map out."
   [args]
   (let [help-flags #{"--help" "-h"}
         has-help?  (some help-flags args)
-        kv-args    (remove help-flags args)]
+        kv-args    (normalize-args (remove help-flags args))]
     (when (odd? (count kv-args))
       (throw (ex-info "Arguments must be key-value pairs"
                       {:error-type :invalid-arguments})))

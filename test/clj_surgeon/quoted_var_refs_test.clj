@@ -201,3 +201,25 @@
         (is (:source-unchanged result)))
       (finally
         (delete-tree! root)))))
+
+;; Fence review 2026-10-21 (F4): the walk followed a symlinked directory out
+;; of the workspace and dropped its files only afterwards; a link to /usr cost
+;; seconds per request.
+(deftest the-walk-never-descends-into-a-directory-outside-the-workspace
+  (let [base (.toFile (java.nio.file.Files/createTempDirectory "walk-confinement" (make-array java.nio.file.attribute.FileAttribute 0)))
+        root (doto (io/file base "project" "src" "app") .mkdirs)
+        outside (doto (io/file base "outside" "deep") .mkdirs)
+        listed (atom [])]
+    (try
+      (spit (io/file root "core.clj") "(ns app.core)\n")
+      (spit (io/file outside "evil.clj") "(ns evil)\n")
+      (java.nio.file.Files/createSymbolicLink (.toPath (io/file root "link"))
+                                              (.toPath (io/file base "outside"))
+                                              (make-array java.nio.file.attribute.FileAttribute 0))
+      (let [real-list @#'quoted-var-refs/list-children
+            files (with-redefs-fn {#'quoted-var-refs/list-children
+                                   (fn [dir] (swap! listed conj (.getCanonicalPath dir)) (real-list dir))}
+                    #(quoted-var-refs/workspace-files (str (io/file base "project")) ["src"]))]
+        (is (= ["core.clj"] (mapv #(.getName %) files)))
+        (is (not-any? #(.startsWith ^String % (.getCanonicalPath (io/file base "outside"))) @listed)))
+      (finally (delete-tree! base)))))

@@ -483,7 +483,71 @@
 
 (def extraction-fields
   #{"file" "to" "forms" "require_policy" "caller_changes"
-    "ignored_caller_files" "public_forms" "expect" "source_hash"})
+    "ignored_caller_files" "public_forms" "expect" "source_hash"
+    "callers" "callers_proposal_hash" "into_existing" "above" "below" "at_start" "at_end"
+    "source_roots"})
+
+(defn- typed-refusal!
+  [error-type path message & [data]]
+  (refuse! error-type path message (merge {:error-type error-type} data)))
+
+;; @spec MCP-OP-PLAN-011
+;; @spec MCP-OP-PLAN-013
+;; @spec MCP-OP-PLAN-014
+(defn- move-fields
+  "The move and caller-decision fields of an extraction request, validated."
+  [raw]
+  (let [callers (when (present? raw "callers")
+                  (let [value (field raw "callers")]
+                    (when-not (= "accept-proposed" value)
+                      (typed-refusal! :invalid-callers-decision ["extraction" "callers"]
+                                      "callers takes one value: accept-proposed"
+                                      {:actual value}))
+                    :accept-proposed))
+        proposal-hash (when (present? raw "callers_proposal_hash")
+                        (let [value (field raw "callers_proposal_hash")]
+                          (when-not (and (string? value) (re-matches #"[0-9a-f]{64}" value))
+                            (refuse! :invalid-hash ["extraction" "callers_proposal_hash"]
+                                     "callers_proposal_hash must be a lowercase SHA-256 hex string"))
+                          (when-not callers
+                            (typed-refusal! :conflicting-caller-decisions ["extraction" "callers_proposal_hash"]
+                                            "callers_proposal_hash binds callers accept-proposed; send both"))
+                          value))
+        into-existing (when (present? raw "into_existing")
+                        (let [value (field raw "into_existing")]
+                          (when-not (boolean? value)
+                            (refuse! :expected-boolean ["extraction" "into_existing"]
+                                     "Expected true or false"))
+                          value))
+        anchor (into {}
+                     (concat
+                       (for [k ["above" "below"] :when (present? raw k)]
+                         [(keyword k) (nonblank-string! (field raw k) ["extraction" k])])
+                       (for [k ["at_start" "at_end"] :when (present? raw k)]
+                         (do (when-not (true? (field raw k))
+                               (refuse! :expected-true ["extraction" k] "Send true or omit the field"))
+                             [(keyword (str/replace k "_" "-")) true]))))
+        _ (when (and (seq anchor) (not into-existing))
+            (typed-refusal! :anchor-without-into-existing ["extraction"]
+                            "above, below, at_start and at_end place forms in an existing namespace; set into_existing"))
+        source-roots (when (present? raw "source_roots")
+                       (let [roots (field raw "source_roots")]
+                         (when-not (and (vector? roots) (every? string? roots))
+                           (refuse! :expected-array ["extraction" "source_roots"]
+                                    "Expected an array of workspace-relative directories"))
+                         (when-let [bad (seq (filter #(or (str/blank? %)
+                                                          (.isAbsolute (java.io.File. ^String %))
+                                                          (some #{".."} (str/split % #"[/\\]")))
+                                                     roots))]
+                           (typed-refusal! :invalid-source-roots ["extraction" "source_roots"]
+                                           "source_roots takes directories relative to the workspace, inside it"
+                                           {:source-roots (vec bad)}))
+                         roots))]
+    (cond-> {}
+      callers (assoc :callers callers)
+      proposal-hash (assoc :callers-proposal-hash proposal-hash)
+      into-existing (assoc :into-existing true :anchor anchor)
+      source-roots (assoc :source-roots source-roots))))
 
 (def extraction-expect-fields #{"forms" "caller_edits" "files"})
 
@@ -541,6 +605,10 @@
               _ (when-not (= (count ignored) (count (distinct ignored)))
                   (refuse! :duplicate-path ["extraction" "ignored_caller_files"]
                            "Ignored caller paths must be unique"))
+              moves (move-fields raw)
+              _ (when (and (:callers moves) (or (seq callers) (seq ignored)))
+                  (typed-refusal! :conflicting-caller-decisions ["extraction" "callers"]
+                                  "callers accept-proposed cannot combine with caller_changes or ignored_caller_files"))
               raw-expect (field raw "expect")
               derived-expect
               {:forms (count forms)
@@ -576,7 +644,8 @@
                           :caller-changes callers
                           :ignored-caller-files ignored
                           :expect expect}
-              normalized (cond-> normalized
+              normalized (cond-> (merge normalized moves)
+                           (not (present? raw "expect")) (assoc :expect-derived true)
                            public-forms-present?
                            (assoc :public-forms public-forms)
                            source-hash (assoc :source-hash source-hash))
@@ -1230,6 +1299,37 @@
       (contains? result :completed-plan)
       (assoc :completed_plan
              (public-extraction-data (:completed-plan result)))
+      ;; @spec MCP-OP-PLAN-011
+      ;; @spec MCP-OP-PLAN-012
+      ;; @spec MCP-OP-PLAN-014
+      ;; The proposal and the move's refusal evidence, so the caller can
+      ;; decide or correct the request in one round.
+      (contains? result :callers-proposed)
+      (assoc :callers_proposed (public-extraction-data (:callers-proposed result)))
+      (contains? result :caller-problems)
+      (assoc :caller_problems (public-extraction-data (:caller-problems result)))
+      (contains? result :references)
+      (assoc :references (public-extraction-data (:references result)))
+      (contains? result :callers-proposal-hash)
+      (assoc :callers_proposal_hash (:callers-proposal-hash result))
+      (contains? result :cycle) (assoc :cycle (:cycle result))
+      (contains? result :candidates) (assoc :candidates (:candidates result))
+      (contains? result :limit) (assoc :limit (:limit result))
+      (contains? result :source-roots) (assoc :source_roots (:source-roots result))
+      (contains? result :next-step) (assoc :next_step (:next-step result))
+      (contains? result :new-errors)
+      (assoc :new_errors (public-extraction-data (:new-errors result)))
+      (contains? result :names) (assoc :names (:names result))
+      (contains? result :core-names) (assoc :core_names (:core-names result))
+      (contains? result :captures)
+      (assoc :captures (public-extraction-data (:captures result)))
+      (contains? result :left-behind)
+      (assoc :left_behind (public-extraction-data (:left-behind result)))
+      (contains? result :suggested-forms) (assoc :suggested_forms (:suggested-forms result))
+      (contains? result :matches) (assoc :matches (public-extraction-data (:matches result)))
+      (contains? result :alternatives) (assoc :alternatives (:alternatives result))
+      (contains? result :conflicts)
+      (assoc :conflicts (public-extraction-data (:conflicts result)))
       (contains? result :next-call)
       (assoc :next_call (public-extraction-data (:next-call result)))
       (contains? result :next-action)

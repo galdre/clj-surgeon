@@ -386,6 +386,68 @@ Similarity and ranking evidence cannot close an unknown. This fast path is an
 MCP apply contract only ; the CLI `extract!` review policy and its source-hash
 surface remain unchanged.
 
+## #Moving into an existing namespace and proposed caller rewrites
+
+`extraction` also moves forms into a namespace file that already exists:
+`into_existing: true` with exactly one anchor (`above` or `below` a named
+target form, `at_start`, or `at_end`). The pure move planner owns the
+mechanics (placement, requires, qualifier rewrites, visibility, refusals);
+its leaf design is
+[Move Forms Into an Existing Namespace](../../plans/move-into-existing-namespace.md).
+`require_policy` stays required on every request and has no effect with
+`into_existing`, because the move merges the destination's own requires.
+
+For both destinations the kernel also computes a proposal: the exact rewrite
+of every caller in other files it can rewrite (aliased and fully qualified
+references, var quotes, referred names, and the requires they need), the
+references it cannot rewrite exactly with file, line, and reason, and any
+require cycle the rewrites would close. The proposal is evidence; the caller
+semantics stay the model's. The model decides in one of two ways:
+
+- **Its own decisions**, as before: `caller_changes` and
+  `ignored_caller_files` account for every candidate, and only those changes
+  are written. The proposal's refusals do not block this route, since the
+  model edits those callers itself.
+- **`callers: "accept-proposed"`**: an explicit decision to write the
+  proposal with the move in the same transaction. It cannot be combined with
+  `caller_changes` or `ignored_caller_files`, and it refuses when the
+  proposal holds an unrewritable reference or a cycle.
+
+Omission is still never a decision: a request with candidates and no decision
+refuses with `extraction-decisions-required`, and the refusal now carries the
+proposal so one accepting call can follow. Its `next_call` keeps every move
+field and never repeats the refused call: with a clean proposal it offers
+`callers: "accept-proposed"` with the proposal's `callers_proposal_hash`;
+with unrewritable references it leaves `caller_changes` and
+`ignored_caller_files` as null holes. The hash identifies each proposed file
+with the hashes of its current and proposed bytes; acceptance that carries
+it refuses with `stale-caller-proposal` when apply would write anything else,
+so acceptance binds to the proposal the model reviewed. Planning publishes
+the same hash and keeps `source_roots` in its next call.
+
+Caller discovery reads the workspace's declared source roots (or
+`source_roots`), confined to the real workspace root; the walk never
+descends into a directory whose real path leaves it. Before any file is read,
+the listing is bounded at 20,000 files and 256 MiB, refusing with
+`workspace-scan-budget-exceeded` above either. A file is parsed only
+when its bytes contain a moved name and the source namespace or its last
+segment. Above 1,000 such candidate files the request refuses with
+`caller-scan-budget-exceeded` before parsing any of them; the largest measured
+real fan-out is 238.
+
+Every written file (source, destination, and any written caller) goes through
+the existing failure-atomic transaction and one receipt. clj-kondo then runs
+over them through the analyzer admission path, before and after; a new error,
+or a new unresolved Var, namespace, or symbol at any level, undoes the whole
+transaction, because clj-kondo reports a dangling `ns/missing` as a warning.
+Unavailable analyzer authority before the write reports lint as unchecked;
+a check that ran before the write but cannot complete after it (timeout,
+admission failure) undoes the transaction as `lint-unverified`, since the
+write was never checked. A requested `verify`
+profile runs afterwards with its existing semantics. The formatter formats a
+created destination as before, and for `into_existing` only the moved block,
+as standalone text before placement.
+
 # #Exact Repository Verifier Boundary
 
 The exact verifier is a closed workspace capability, not an arbitrary command
@@ -1247,6 +1309,9 @@ existing lossless transaction contract.
 | Internal extraction completion | Preserve omitted visibility through validation, derive only from the executor's complete frozen workspace, and reuse the existing extraction transaction | Require public `plan-extraction` ; add `resolve: mechanical`; route CLI through MCP policy | Omission is the shortest honest caller shape, explicit values stay authoritative, and no second plan algebra or CLI compatibility change is introduced. |
 | Extraction planning entrance | A top-level `inspect_clojure` mission over the shared pure planner | Fifth public tool ; typed batch read operation; CLI subprocess | Planning is a coherent workspace-wide read mission, not one file read, and reuses the existing public read envelope. |
 | Plan-to-apply authority | Exact source hash plus explicit caller decisions | Retained in-memory plan ; similarity; unguarded replay | The hash is transport-neutral, stale-safe, and grants no implicit write authority. |
+| Kernel caller proposals | Compute exact caller rewrites as evidence; write them only on an explicit `callers: "accept-proposed"` | Write them by default ; report candidates only | Caller semantics stay the model's, while one explicit decision replaces hand-written edits the kernel can prove. |
+| Move into an existing namespace | `into_existing` and one anchor on the `extraction` object | A separate top-level request | One request shape and one transaction path for both destinations. |
+| Lint gate on every written file | Always-on admission-gated clj-kondo; block on errors and unresolved references at any level | Only with `verify` ; the `fast` profile's warning-level delta | A dangling reference is a warning to clj-kondo; any new warning is too strict for a gate that cannot be turned off. |
 | Workspace source universe | One deterministic shared scanner for planning and execution | Duplicate scans in each handler ; semantic index as authority | Both phases must reason over identical eligible paths and exact bytes without another index lifecycle. |
 | Exact repository verifier | Project-owned `"exact"` profile with `:acceptance :exact-exit` ; execute one closed argv after candidate read-back | Arbitrary request command; generic `verify=fast`; clj-kondo diagnostic delta; external second action | It deletes one model boundary without changing file scope, warning policy, command arguments, or rollback authority. |
 | EDN edit scope | Exact root-scoped literal edits, optionally grouped across explicit files | Extension allowlist only ; all structural operations; native patch only | Root scope reuses the lossless transaction kernel while preventing namespace/owner claims that EDN cannot support. |

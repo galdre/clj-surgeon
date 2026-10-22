@@ -321,3 +321,111 @@
                (str/index-of moved "(defn run-kondo")))
         (is (str/blank? err)))
       (finally (.delete tmp)))))
+
+;; ============================================================
+;; Subprocess CLI — moving forms into an existing namespace
+;; (docs/plans/move-into-existing-namespace.md), in the GNU style the plan
+;; documents
+;; ============================================================
+
+(defn- invoice-project! []
+  (let [root (doto (java.io.File/createTempFile "clj-surgeon-cli-move-into" "") .delete .mkdirs)]
+    (spit (io/file root "deps.edn") "{:paths [\"src\"] :aliases {:test {:extra-paths [\"test\"]}}}\n")
+    (doseq [[path text]
+            {"src/billing/customer.clj"
+             "(ns billing.customer)\n\n(defn email [c] (:email c))\n"
+             "src/billing/invoice.clj"
+             (str "(ns billing.invoice\n  (:require\n   [billing.customer :as customer]))\n\n"
+                  "(defn- has-email? [c] (some? (customer/email c)))\n\n"
+                  "(defn deliver! [c] (when (has-email? c) :queued))\n")
+             "test/billing/invoice_test.clj"
+             (str "(ns billing.invoice-test\n  (:require\n   [billing.invoice]\n   [clojure.test :refer [deftest is]]))\n\n"
+                  "(deftest has-email (is (#'billing.invoice/has-email? {:email \"a@b\"})))\n")}]
+      (let [f (io/file root path)]
+        (.mkdirs (.getParentFile f))
+        (spit f text)))
+    root))
+
+(defn- delete-tree! [f]
+  (when (.isDirectory f) (run! delete-tree! (.listFiles f)))
+  (.delete f))
+
+(deftest cli-move-into-existing-plans-applies-and-refuses-with-edn
+  (let [root (invoice-project!)
+        path #(str (io/file root %))
+        move-args ["--file" (path "src/billing/invoice.clj") "--forms" "[has-email?]"
+                   "--to" (path "src/billing/customer.clj") "--into-existing"]]
+    (try
+      (testing "help documents the flags"
+        (let [{:keys [out]} (run-cli "extract!" "--help")]
+          (is (str/includes? out "into-existing"))
+          (is (str/includes? out "source-roots"))
+          (is (str/includes? out "accept-proposed"))))
+      (testing "a refusal is EDN with a nonzero exit and leaves every file unchanged"
+        (let [before (slurp (path "test/billing/invoice_test.clj"))
+              {:keys [exit out]} (apply run-cli "extract!" (concat move-args ["--below" "nope"]))]
+          (is (pos? exit))
+          (is (= :anchor-not-found (:error-type (edn/read-string out))))
+          (is (= before (slurp (path "test/billing/invoice_test.clj"))))))
+      (testing "the plan names the caller it will rewrite"
+        (let [{:keys [exit out]} (apply run-cli "extract" (concat move-args ["--below" "email"]))
+              result (edn/read-string out)]
+          (is (zero? exit))
+          (is (= ["test/billing/invoice_test.clj"] (:callers-to-review result)))))
+      (testing "without a decision the apply refuses with the proposal"
+        (let [before (slurp (path "test/billing/invoice_test.clj"))
+              {:keys [exit out]} (apply run-cli "extract!" (concat move-args ["--below" "email"]))]
+          (is (pos? exit))
+          (is (= :extraction-decisions-required (:error-type (edn/read-string out))))
+          (is (= before (slurp (path "test/billing/invoice_test.clj"))))))
+      (testing "the apply rewrites the caller once accepted"
+        (let [{:keys [exit out err]} (apply run-cli "extract!" (concat move-args ["--below" "email"
+                                                                                  "--callers" "accept-proposed"]))
+              result (edn/read-string out)]
+          (is (zero? exit) err)
+          (is (:applied result))
+          (is (= 3 (:files-written result)))
+          (is (str/includes? (slurp (path "test/billing/invoice_test.clj"))
+                             "#'billing.customer/has-email?"))))
+      (finally (delete-tree! root)))))
+
+;; Decision 9 of docs/plans/move-into-existing-namespace.md: extract! to a new
+;; namespace rewrites callers too.
+(deftest cli-extract-to-a-new-namespace-rewrites-callers-and-prints-no-file-contents
+  (let [root (invoice-project!)
+        path #(str (io/file root %))
+        extract-args ["--file" (path "src/billing/invoice.clj") "--forms" "[has-email?]"
+                      "--to" (path "src/billing/contact.clj")]]
+    (try
+      (testing "the plan names the caller and carries no file contents"
+        (let [{:keys [exit out]} (apply run-cli "extract" extract-args)
+              result (edn/read-string out)]
+          (is (zero? exit))
+          (is (= ["test/billing/invoice_test.clj"] (:callers-to-review result)))
+          (is (empty? (filter #(str/starts-with? (name %) "_") (keys result))))
+          (is (< (count out) 4096))))
+      (testing "the apply rewrites the caller once accepted"
+        (let [{:keys [exit out err]} (apply run-cli "extract!" (concat extract-args ["--callers" "accept-proposed"]))
+              result (edn/read-string out)]
+          (is (zero? exit) err)
+          (is (= 3 (:files-written result)))
+          (is (str/includes? (slurp (path "test/billing/invoice_test.clj"))
+                             "#'billing.contact/has-email?"))))
+      (finally (delete-tree! root)))))
+
+;; Fence review 2026-10-21 (F9 and F10): CLI values and a repository's deps.edn were read with
+;; clojure.core/read-string, which evaluates #=(...).
+(deftest cli-values-and-build-files-are-read-without-evaluation
+  (let [dir (doto (java.io.File/createTempFile "clj-surgeon-read-eval" "") .delete .mkdirs)
+        marker (io/file dir "PWNED")
+        payload (str "#=(clojure.core/spit \"" (.getPath marker) "\" \"x\")")]
+    (try
+      (testing "a CLI EDN value"
+        (is (thrown? Exception (core/parse-val (str "[" payload "]"))))
+        (is (not (.exists marker))))
+      (testing "a deps.edn read for source paths"
+        (let [deps (io/file dir "deps.edn")]
+          (spit deps (str "{:paths [" payload "]}"))
+          (is (= ["src"] (#'core/extract-source-paths (.getPath deps))))
+          (is (not (.exists marker)))))
+      (finally (delete-tree! dir)))))

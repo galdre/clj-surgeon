@@ -44,12 +44,73 @@ and side-effect requires survive. Compile and test that conservative move;
 remove excess requirements in a later change. Do not hand-assemble a new
 namespace header when `:copy-all` can preserve it exactly.
 
-The dry run also reports authority-labeled `quoted-var-references` for exact
-`#'name` and `(var name)` callers that semantic indexes can omit. Review all
-caller evidence before applying. Execution parses and hash-verifies both future
-files before it publishes the receipt. The inverse refuses if either result
-drifted. After execution, compile and test. Migrate other namespaces explicitly
-rather than introducing circular dependencies.
+### Moving into an existing namespace
+
+When the target namespace file already exists, add `--into-existing` and name
+exactly one anchor: `--above FORM`, `--below FORM`, `--at-start` (after the
+`ns` form) or `--at-end`. Several forms keep their source order as one block.
+Preview first; the preview writes nothing:
+
+```bash
+clj-surgeon extract --file src/billing/invoice.clj --forms '[has-email?]' \
+  --to src/billing/customer.clj --into-existing --below email
+clj-surgeon extract! --file src/billing/invoice.clj --forms '[has-email?]' \
+  --to src/billing/customer.clj --into-existing --below email \
+  --callers accept-proposed --receipt-out /tmp/move.edn
+clj-surgeon undo-extract! --receipt /tmp/move.edn
+```
+
+The move adds missing target requires at their sorted positions, rewrites the
+moved forms' qualifiers to the target's aliases (`customer/email` becomes
+`email` inside `billing.customer`), makes moved private forms that the source
+still calls public, adds a `:refer` for them to the source, and removes
+source requires that only the moved forms used (never a bare libspec that may
+be loaded for side effects). It refuses
+before any write on: an anchor the definition list does not know (the refusal
+shows the `.clj-surgeon.edn` `:aliases` entry for an unrecognized macro), an
+ambiguous anchor (use a typed one such as `'defmethod render :card'`), a name
+the target already defines, a plain symbol that would mean something else in
+the target, a moved form that calls one left behind (move the suggested set
+together), an alias conflict, a reference it cannot rewrite exactly, or a
+circular require. Callers in other files are proposed, and rewritten in the
+same move only with `--callers accept-proposed`; without it, `extract!`
+refuses with `:extraction-decisions-required` and the proposal, and changes
+nothing. The rules:
+`inv/has-email?` takes the caller's alias for the target (one is added when
+missing), `billing.invoice/has-email?` and `#'billing.invoice/has-email?`
+keep their fully qualified spelling, and a referred name moves to a `:refer`
+on the target libspec, with its `:rename` entry; a `:refer :all` or `:use`
+caller gains a refer of the moved name. References inside reader
+conditionals are rewritten when the target is `.cljc`. Requires that a
+rewrite leaves unused are removed. The target's own calls through the source
+become plain names. Callers are found under the declared source roots; pass
+`--source-roots '["src" "test"]'` to scan other directories.
+`:caller-not-rewritable` names each file, line and reason (`:prefix-list` or
+`:reader-conditional` for a source libspec whose alias cannot be read,
+`:runtime-require` outside a `comment` form, `:target-platform`, `:rename`
+in the target itself, `:no-ns-form`, `:unparsable`). A `require` of the
+source inside a `comment` form is left unchanged with a warning. Moving a
+protocol moves its methods; moving a record or type moves its constructors.
+A call that would become a plain name a local captures refuses, as does a
+moved name that would shadow a `clojure.core` Var the target refers.
+Every file is hash-fenced, and a new clj-kondo error or unresolved reference
+in any written file restores them all. Warnings name moved unqualified `::` keywords, moved forms
+placed above a target form they call, and rewritten alias-qualified quoted
+symbols (`'inv/has-email?`), which resolve through whatever namespace is
+current at run time.
+
+Both forms of `extract!` propose callers in other files the same way (the
+dry run's `callers-proposed`) and write them only with
+`--callers accept-proposed`, reporting `callers-rewritten` and
+`callers-to-review`; a caller that
+cannot be rewritten exactly, or a rewrite that closes a require cycle,
+refuses before any write. The dry run also reports authority-labeled
+`quoted-var-references` for exact `#'name` and `(var name)` callers that
+semantic indexes can omit. Execution parses and hash-verifies every future
+file before it publishes the receipt, and a new clj-kondo error or unresolved
+reference in any written file restores them all. Receipts are signed with a
+per-user key; undo refuses a receipt that is unsigned, altered, or whose
+results drifted. After execution, compile and test.
 
 When a namespace contains or gains `(declare ...)`, inspect first, then apply:
 

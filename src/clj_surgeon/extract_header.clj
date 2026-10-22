@@ -281,3 +281,25 @@
 
 (defn source-referred-forms [callers]
   (->> callers (mapcat :moved-vars) distinct sort vec))
+
+(defn libspec-entries
+  "The direct :require libspecs of one namespace form, each as
+  {:namespace :alias :referred :renamed :source}, or a typed refusal for a
+  require shape the header compiler cannot reason about."
+  [ns-form]
+  (let [parsed (direct-libspecs ns-form)]
+    (if-not (:ok parsed)
+      parsed
+      {:ok true :entries (mapv #(dissoc % :ok) (:entries parsed))})))
+
+(defn form-free-symbols
+  "Free symbols, as strings, used by the given form sources."
+  [form-sources]
+  (source-free-symbols form-sources))
+
+(defn libspec-used?
+  "Does a libspec entry serve any of the given form sources?"
+  [entry form-sources]
+  (boolean (libspec-required? entry
+                              (source-free-symbols form-sources)
+                              (source-qualified-keyword-prefixes form-sources))))
