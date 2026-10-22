@@ -4,6 +4,7 @@
   covered by move-into-test with literal sources."
   (:require
    [babashka.fs :as fs]
+   [clj-surgeon.lint-gate :as lint-gate]
    [clj-surgeon.move-into-shell :as shell]
    [clojure.java.io :as io]
    [clojure.string :as str]
@@ -235,7 +236,7 @@
         (let [result (shell/execute! (dissoc (opts root) :lint))]
           (is (:applied result))
           (is (= {:checked true :files 3 :new-errors 0} (:lint result)))
-          (is (= [] (->> (:findings (shell/clj-kondo-lint files))
+          (is (= [] (->> (:findings (lint-gate/clj-kondo-lint files))
                          (filter #(= :error (keyword (:level %))))
                          (mapv #(select-keys % [:filename :row :message]))))))
         (finally (delete-recursive! root))))))
@@ -247,7 +248,7 @@
   (let [finding (fn [type level] {:filename "src/a.clj" :row 3 :type type :level level
                                   :message (str type)})]
     (is (= [:unresolved-var :unresolved-namespace :unresolved-symbol :syntax]
-           (mapv :type (shell/new-blocking-findings
+           (mapv :type (lint-gate/new-blocking-findings
                          [(finding :unused-binding :warning)]
                          [(finding :unused-binding :warning)
                           (finding :unresolved-var :warning)
@@ -256,8 +257,8 @@
                           (finding :syntax :error)
                           (finding :redundant-do :warning)]))))
     (testing "a finding the baseline already had does not block"
-      (is (= [] (shell/new-blocking-findings [(finding :unresolved-var :warning)]
-                                             [(finding :unresolved-var :warning)]))))))
+      (is (= [] (lint-gate/new-blocking-findings [(finding :unresolved-var :warning)]
+                  [(finding :unresolved-var :warning)]))))))
 
 (deftest clj-kondo-reports-a-dangling-qualified-reference
   (if-not (fs/which "clj-kondo")
@@ -271,5 +272,5 @@
         (spit b "(ns app.b\n  (:require [app.a :as a]))\n\n(defn f [] [(a/present) (a/moved-away)])\n")
         (is (= [{:type :unresolved-var :message "Unresolved var: a/moved-away"}]
                (mapv #(select-keys % [:type :message])
-                     (shell/new-blocking-findings [] (:findings (shell/clj-kondo-lint [a b]))))))
+                     (lint-gate/new-blocking-findings [] (:findings (lint-gate/clj-kondo-lint [a b]))))))
         (finally (delete-recursive! root))))))

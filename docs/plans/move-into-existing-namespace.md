@@ -1,6 +1,6 @@
 # Move Forms Into an Existing Namespace
 
-**Status:** Stages 1, 2 and 3 built 2026-10-21 on branch `fix/cli-extract-public-forms`; stage 4 open. Decisions answered by galdre on the decision page
+**Status:** Stages 1, 2 and 3 built 2026-10-21 on branch `fix/cli-extract-public-forms`, and new-file `extract!` rewrites callers (decision 9); stage 4 open. Decisions answered by galdre on the decision page
 "Move Into Existing Namespace" (key `move-into-ns`).
 **Motivating evidence:** the invoice refactoring trial (2026-10-21). An agent
 building domain vocabulary namespaces needed to move helpers such as
@@ -112,6 +112,16 @@ Running example:
   reporting callers instead of rewriting them.
 - **New-file extraction (9).** `extract!` to a new file rewrites callers
   too. Both verbs keep `:callers-to-review`, listing the rewritten callers.
+  Built on the CLI: the same pure caller step (`move-callers/rewrite-callers`
+  through `extract/with-caller-rewrites`), the cycle check, hash fences on
+  every caller, the clj-kondo gate on every written file, and a version 2
+  receipt listing the callers. The MCP new-file extraction, whose agents
+  supply `caller_changes`, is unchanged until stage 4.
+  The new clj-kondo gate found that the extraction tests' fixture had always
+  produced a target with an unresolved symbol (`distill` called `helper`,
+  which stayed behind); the fixture now extracts a valid program. A
+  plan-time refusal for forms left behind, as the move has, is open for
+  new-file extraction.
 - **MCP (10, 11, 12).** `extraction` gains `into_existing` and the four
   anchor fields; `caller_changes` and `ignored_caller_files` refuse with
   `into_existing`. clj-kondo rollback covers every rewritten file, the
@@ -266,6 +276,12 @@ s) and stop at a stage 2 limit instead: `app.util`'s `:require` holds a
 `#?@(:clj ...)` splice, which the header merge refuses with
 `:unsupported-require-minimization`. Moving forms out of a `.cljc` source
 whose requires use reader conditionals is open.
+
+New-file `extract!` with caller rewrites (decision 9), same codebase copy:
+`valid-uuid?` into a new `app.util.uuid` wrote 10 files in 1.5 s, the
+real clj-kondo gate linted all 10 with no new blocking finding, the five
+rewritten source namespaces loaded in a cold JVM, and `undo-extract!`
+restored the source and 8 callers and removed the target.
 
 ## Stages
 

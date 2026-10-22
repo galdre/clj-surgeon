@@ -9,7 +9,10 @@
    [rewrite-clj.parser :as parser]))
 
 (defn- create-temp-project!
-  "Create a minimal project with a monolith file."
+  "Create a minimal project with a monolith file. distill does not call
+  helper: extracting [distill refine] then leaves a valid program, which the
+  extraction's clj-kondo gate requires. (It once called helper, and every
+  extraction of these tests wrote a target with an unresolved symbol.)"
   []
   (let [root (java.io.File/createTempFile "extract-test" "")
         _ (.delete root)
@@ -27,7 +30,7 @@
 
 ;; Distillery functions
 (defn distill [x]
-  (helper x))
+  (keyword x))
 
 (defn refine [x]
   (distill (str x \"-refined\")))
@@ -908,3 +911,139 @@
         (is (= original (slurp source)))
         (is (not (.exists target))))
       (finally (delete-recursive! root)))))
+
+;; ============================================================
+;; Callers in other files (decision 9 of
+;; docs/plans/move-into-existing-namespace.md: extract! to a new file rewrites
+;; callers too)
+;; ============================================================
+
+(deftest pure-compile-plan-refers-moved-protocol-methods-the-source-still-calls
+  ;; Eval-side report (2026-10-21): protocol methods. Extracting Shape left
+  ;; main's (area x) unresolved.
+  (let [plan (extract/compile-plan
+               {:file "src/app/source.clj"
+                :source (str "(ns app.source)\n\n"
+                             "(defprotocol Shape\n  (area [this]))\n\n"
+                             "(defn main [x] (area x))\n")
+                :forms '[Shape]
+                :to "src/app/shape.clj"
+                :target-ns "app.shape"})]
+    (is (= ["area"] (:source-referred-forms plan)))
+    (is (= ["Shape" "area"] (:moved-vars plan)))))
+
+(deftest pure-caller-rewrites-for-a-new-namespace
+  (let [source "(ns app.source)\n\n(defn f [] 1)\n\n(defn g [] 2)\n"
+        plan (extract/compile-plan {:file "src/app/source.clj" :source source :forms '[f]
+                                    :to "src/app/fresh.clj" :target-ns "app.fresh"})
+        sources {"src/app/source.clj" source
+                 "src/app/use.clj" "(ns app.use\n  (:require [app.source :as s]))\n\n(defn h [] [(s/f) (s/g)])\n"
+                 "test/app/source_test.clj" "(ns app.source-test\n  (:require [app.source]))\n\n(#'app.source/f)\n"}
+        r (extract/with-caller-rewrites plan sources)]
+    ;; The sorted insert keeps an existing one-line :require layout.
+    (is (= {"src/app/use.clj" (str "(ns app.use\n  (:require [app.fresh :as fresh]\n   [app.source :as s]))\n\n"
+                                   "(defn h [] [(fresh/f) (s/g)])\n")
+            "test/app/source_test.clj" (str "(ns app.source-test\n  (:require [app.fresh]\n   [app.source]))\n\n"
+                                            "(#'app.fresh/f)\n")}
+           (:_callers r)))
+    (is (= ["src/app/use.clj" "test/app/source_test.clj"] (:callers-to-review r)))
+    (is (= [1 1] (mapv :rewritten (:callers-rewritten r))))
+    (testing "a caller that cannot be rewritten refuses"
+      (let [r (extract/with-caller-rewrites
+                plan (assoc sources "dev/user.clj" "(ns user)\n\n(defn go [] (require 'app.source) ((resolve 'app.source/f)))\n"))]
+        (is (= :caller-not-rewritable (:error-type r)))
+        (is (= [:runtime-require] (mapv :reason (:references r))))))
+    (testing "a rewrite that would close a require cycle refuses"
+      (let [plan (extract/compile-plan
+                   {:file "src/app/source.clj"
+                    :source "(ns app.source\n  (:require [app.use :as u]))\n\n(defn f [] (u/k))\n"
+                    :forms '[f] :to "src/app/fresh.clj" :target-ns "app.fresh"
+                    :require-policy :minimal})
+            r (extract/with-caller-rewrites
+                plan {"src/app/use.clj" "(ns app.use\n  (:require [app.source :as s]))\n\n(defn k [] 1)\n(defn h [] (s/f))\n"})]
+        (is (= :circular-require (:error-type r)))
+        (is (= ["app.fresh" "app.use" "app.fresh"] (:cycle r)))))))
+
+(defn- create-caller-project!
+  "The temp project with a deps.edn, an aliased caller, and a test that
+  reaches a moved form through a fully qualified var quote."
+  []
+  (let [root (create-temp-project!)]
+    (spit (io/file root "deps.edn") "{:paths [\"src\"] :aliases {:test {:extra-paths [\"test\"]}}}\n")
+    (.mkdirs (io/file root "test" "my"))
+    (spit (io/file root "src" "my" "cli.clj")
+          "(ns my.cli\n  (:require [my.app :as app]))\n\n(defn run [] [(app/distill 1) (app/helper 2)])\n")
+    (spit (io/file root "test" "my" "app_test.clj")
+          "(ns my.app-test\n  (:require\n   [clojure.test :refer [deftest is]]\n   [my.app]))\n\n(deftest refines (is (#'my.app/refine \"x\")))\n")
+    root))
+
+(deftest test-execute-rewrites-callers-and-undo-restores-them
+  (let [root (create-caller-project!)
+        files (mapv #(io/file root %) ["src/my/app.clj" "src/my/cli.clj" "test/my/app_test.clj"])
+        target (io/file root "src" "my" "distillery.clj")
+        receipt (io/file root "extract.edn")
+        before (mapv slurp files)]
+    (try
+      (let [result (extract/execute! {:file (.getPath (first files))
+                                      :forms '[distill refine]
+                                      :to (.getPath target)
+                                      :receipt-out (.getPath receipt)
+                                      :lint (fn [_] {:checked false})})]
+        (is (str/includes? (slurp (nth files 1)) "[(distillery/distill 1) (app/helper 2)]"))
+        (is (str/includes? (slurp (nth files 2)) "(#'my.distillery/refine \"x\")"))
+        (is (= ["src/my/cli.clj" "test/my/app_test.clj"] (:callers-to-review result)))
+        (is (= 2 (count (:callers-rewritten result))))
+        (testing "undo restores every file and removes the target"
+          (is (true? (:ok (extract/undo! {:receipt (.getPath receipt)}))))
+          (is (= before (mapv slurp files)))
+          (is (not (.exists target)))))
+      (finally (delete-recursive! root)))))
+
+(deftest test-execute-refuses-a-caller-that-changed-after-planning
+  (let [root (create-caller-project!)
+        source (io/file root "src" "my" "app.clj")
+        caller (io/file root "src" "my" "cli.clj")
+        target (io/file root "src" "my" "distillery.clj")
+        before (slurp source)
+        real-plan extract/plan]
+    (try
+      (let [result (with-redefs [extract/plan (fn [opts]
+                                                (let [p (real-plan opts)]
+                                                  (spit caller (str (slurp caller) ";; edited\n"))
+                                                  p))]
+                     (extract/execute! {:file (.getPath source) :forms '[distill refine]
+                                        :to (.getPath target) :lint (fn [_] {:checked false})}))]
+        (is (= :stale-extraction-source (:error-type result)))
+        (is (= ["src/my/cli.clj"] (:changed result)))
+        (is (= before (slurp source)))
+        (is (not (.exists target))))
+      (finally (delete-recursive! root)))))
+
+(deftest test-execute-lint-regression-restores-every-file
+  (let [root (create-caller-project!)
+        files (mapv #(io/file root %) ["src/my/app.clj" "src/my/cli.clj" "test/my/app_test.clj"])
+        target (io/file root "src" "my" "distillery.clj")
+        before (mapv slurp files)
+        calls (atom 0)
+        lint (fn [_] (if (= 1 (swap! calls inc))
+                       {:checked true :findings []}
+                       {:checked true :findings [{:filename "src/my/cli.clj" :type :unresolved-var
+                                                  :level :warning :message "Unresolved var: x/y"}]}))]
+    (try
+      (let [result (extract/execute! {:file (.getPath (first files)) :forms '[distill refine]
+                                      :to (.getPath target) :lint lint})]
+        (is (= :lint-regression (:error-type result)))
+        (is (true? (:restored result)))
+        (is (= before (mapv slurp files)))
+        (is (not (.exists target))))
+      (finally (delete-recursive! root)))))
+
+;; Field regression (2026-10-21): extract required lint-gate, which used
+;; babashka.fs and babashka.process. The MCP server's classpath (deps.edn
+;; :deps) has neither, so the server could not load extract and never became
+;; ready. Every namespace the MCP server can reach must load on that classpath.
+(deftest the-mcp-server-classpath-loads-the-extraction-namespaces
+  (let [{:keys [exit err]} (shell/sh "clojure" "-M" "-e"
+                                     (str "(require 'clj-surgeon.extract 'clj-surgeon.lint-gate "
+                                          "'clj-surgeon.move-callers 'clj-surgeon.move-into)"))]
+    (is (zero? exit) err)))

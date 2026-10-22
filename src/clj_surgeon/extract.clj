@@ -19,6 +19,8 @@
    [clj-surgeon.extract-header :as extract-header]
    [clj-surgeon.file-ops :as file-ops]
    [clj-surgeon.forms :as forms]
+   [clj-surgeon.lint-gate :as lint-gate]
+   [clj-surgeon.move-callers :as move-callers]
    [clj-surgeon.outline :as outline]
    [clj-surgeon.quoted-var-refs :as quoted-var-refs]
    [clj-surgeon.structural-lens :as structural-lens]
@@ -259,7 +261,9 @@
     {:source (validate-complete-source! source-file future-source)
      :target (validate-complete-source! target-file target-source)}))
 
-(def ^:private receipt-version 1)
+(def ^:private receipt-version
+  "2 adds :callers, the files a caller rewrite changed. Undo accepts 1."
+  2)
 
 (defn- canonical-path
   [file]
@@ -291,7 +295,7 @@
          :target-unchanged true}))))
 
 (defn- extraction-receipt
-  [{:keys [source-file target-file original-source future-source target-source]}]
+  [{:keys [source-file target-file original-source future-source target-source callers]}]
   {:receipt-version receipt-version
    :operation :extract!
    :source {:file (canonical-path source-file)
@@ -303,6 +307,12 @@
             :absent-before true
             :result-hash (structural-lens/source-hash target-source)
             :result-source target-source}
+   :callers (mapv (fn [{:keys [path original result]}]
+                    {:file (canonical-path path)
+                     :original-source original
+                     :result-hash (structural-lens/source-hash result)
+                     :result-source result})
+                  callers)
    :inverse {:operation :undo-extract!}})
 
 (defn- publish-receipt!
@@ -424,8 +434,17 @@
                              target-ns (:aliases alias-result)))
             remaining-callers
             (extract-header/remaining-source-callers source extracted-names)
+            ;; A protocol's methods and a record's constructors move with
+            ;; their form; the source refers those its remaining forms call.
+            {defined-vars :vars defined-classes :classes}
+            (move-callers/defined-vars-by-form source)
+            moved-extra (set (mapcat #(get defined-vars %) extracted-names))
             source-referred
-            (extract-header/source-referred-forms remaining-callers)
+            (->> (extract-header/form-free-symbols
+                   [(source-without-forms source form-texts)])
+                 (filter moved-extra)
+                 (concat (extract-header/source-referred-forms remaining-callers))
+                 distinct sort vec)
             private-form-names
             (->> matched
                  (filter #(forms/private-form? (str (:type %))))
@@ -540,41 +559,122 @@
            :_source-hash (structural-lens/source-hash source)
            :_new-file-content new-file-content
            :_form-texts form-texts
+           :moved-vars (vec (sort (into extracted-names moved-extra)))
+           :moved-classes (vec (sort (filter defined-classes extracted-names)))
            :_source-referred-forms source-referred})))))
+
+(defn with-caller-rewrites
+  "Rewrite every caller of the extracted Vars in `sources` {path text} to
+  the new namespace, deciding every refusal before any write. Pure: returns
+  the plan with :_callers {path future-text}, :callers-rewritten and
+  :callers-to-review, or a refusal."
+  [{:keys [file to source-ns target-ns moved-vars moved-classes] :as plan} sources]
+  (if (:error plan)
+    plan
+    (let [{:keys [callers problems]}
+          (move-callers/rewrite-callers
+            {:sources sources :exclude [(str file) (str to)]
+             :source-ns source-ns :target-ns target-ns :target-file (str to)
+             :moved moved-vars :moved-classes moved-classes})
+          caller-texts (into {} (map (juxt :file :text)) callers)
+          future-source (when (empty? problems)
+                          (:source (compile-candidates
+                                     {:source (:_source plan)
+                                      :source-file file
+                                      :target-file to
+                                      :form-ranges (:_form-texts plan)
+                                      :target-source (:_new-file-content plan)
+                                      :target-ns target-ns
+                                      :target-alias (:target-alias plan)
+                                      :source-referred-forms (:_source-referred-forms plan)})))
+          graph (when future-source
+                  (into {}
+                        (keep move-callers/ns-requires)
+                        (concat (vals (merge (dissoc sources (str file) (str to)) caller-texts))
+                                [future-source (:_new-file-content plan)])))
+          cycle (some-> graph (move-callers/find-cycle target-ns))
+          refusal {:source-unchanged true :target-unchanged true :files-unchanged true}]
+      (cond
+        (seq problems)
+        (merge refusal
+               {:error "A reference to an extracted form cannot be rewritten exactly"
+                :error-type :caller-not-rewritable
+                :references problems
+                :next-step "Change or remove each listed reference, then extract again"})
+
+        cycle
+        (merge refusal
+               {:error "Rewriting the callers would make namespaces require each other"
+                :error-type :circular-require
+                :cycle cycle})
+
+        :else
+        (assoc plan
+               :_callers caller-texts
+               :callers-rewritten (move-callers/caller-summary callers)
+               :callers-to-review (mapv :file callers)
+               :caller-warnings (vec (mapcat :warnings callers)))))))
+
+(defn- relative-to [root path]
+  (let [prefix (str root "/")]
+    (if (str/starts-with? (str path) prefix) (subs (str path) (count prefix)) (str path))))
+
+(defn- relativize-callers
+  "Name reported caller files relative to the project root."
+  [plan root]
+  (let [rel (partial relative-to root)
+        file-entry #(cond-> % (:file %) (update :file rel))]
+    (cond-> plan
+      (:callers-rewritten plan) (update :callers-rewritten (partial mapv file-entry))
+      (:callers-to-review plan) (update :callers-to-review (partial mapv rel))
+      (:caller-warnings plan) (update :caller-warnings (partial mapv file-entry))
+      (:references plan) (update :references (partial mapv file-entry)))))
 
 (defn plan
   "Capture one workspace snapshot and delegate extraction decisions to
-  compile-plan. This is the filesystem shell, not the pure planner.
+  compile-plan and with-caller-rewrites. This is the filesystem shell, not
+  the pure planner. Callers are found under the project's declared source
+  roots, or under :source-roots (relative to the project) when given.
   Without :public-forms, every moved private form that remaining source still
   calls is made public, as on the MCP route. An explicit :public-forms list is
   used as given, and execute! refuses one that omits a required form."
-  [{:keys [file forms to source-paths require-policy public-forms]
+  [{:keys [file forms to source-paths require-policy public-forms source-roots]
     :or {require-policy :minimal}
     :as opts}]
   (try
     (let [source (slurp file)
           target-ns (file-path->ns-name to source-paths)
-          project-root (project-root-for-source file source-paths)
+          project-root (.getCanonicalPath (project-root-for-source file source-paths))
           source-canonical-path (.getCanonicalPath (io/file file))
+          target-canonical-path (.getCanonicalPath (io/file to))
           workspace-sources
-          (->> (file-seq (io/file project-root))
-               (filter #(.isFile %))
-               (filter #(re-matches #".*\.clj[sc]?$" (.getName %)))
-               (remove #(= source-canonical-path (.getCanonicalPath %)))
-               (remove #(str/includes? (.getPath %) "/.git/"))
+          (->> (if source-roots
+                 (quoted-var-refs/workspace-files project-root source-roots)
+                 (quoted-var-refs/workspace-files project-root))
+               (remove #(= source-canonical-path (.getPath %)))
                (map (fn [workspace-file]
                       [(.getPath workspace-file) (slurp workspace-file)]))
-               (into (sorted-map)))]
-      (compile-plan
-        {:file file
-         :source source
-         :forms forms
-         :to to
-         :target-ns target-ns
-         :workspace-sources workspace-sources
-         :require-policy require-policy
-         :public-forms (vec public-forms)
-         :derive-required-public-forms (not (contains? opts :public-forms))}))
+               (into (sorted-map)))
+          compiled (compile-plan
+                     {:file source-canonical-path
+                      :source source
+                      :forms forms
+                      :to target-canonical-path
+                      :target-ns target-ns
+                      :workspace-sources workspace-sources
+                      :require-policy require-policy
+                      :public-forms (vec public-forms)
+                      :derive-required-public-forms (not (contains? opts :public-forms))})
+          planned (with-caller-rewrites compiled workspace-sources)]
+      (cond-> (relativize-callers planned project-root)
+        (not (:error planned))
+        (assoc :file file
+               :to to
+               :_caller-hashes (into {} (map (fn [[path _]]
+                                               [path (structural-lens/source-hash
+                                                       (get workspace-sources path))]))
+                                     (:_callers planned))
+               :_project-root project-root)))
     (catch Exception error
       {:ok false
        :error-type :extraction-snapshot-failed
@@ -588,10 +688,11 @@
 
 (defn execute!
   "Execute an extraction plan.
-   Both future files are compiled and parsed before either file is written.
-   The source write is hash-fenced; a failed commit restores the original
-   source and removes the newly-created target."
-  [{:keys [file to receipt-out] :as opts}]
+   Every future file is compiled and parsed before any file is written. The
+   source and every rewritten caller are hash-fenced. A failed commit, or a
+   new clj-kondo error or unresolved reference in any written file, restores
+   the source and the callers and removes the newly-created target."
+  [{:keys [file to receipt-out lint] :or {lint lint-gate/clj-kondo-lint} :as opts}]
   (let [p (plan opts)]
     (cond
       (:error p)
@@ -626,13 +727,41 @@
             updated-source (:source candidates)
             target-file (io/file to)
             source-file (io/file file)
+            callers (mapv (fn [[path text]] {:path path :original (slurp path) :result text})
+                          (:_callers p))
+            changed-callers (->> callers
+                                 (remove #(= (get-in p [:_caller-hashes (:path %)])
+                                             (structural-lens/source-hash (:original %))))
+                                 (mapv #(relative-to (:_project-root p) (:path %))))
             receipt-error (receipt-refusal receipt-out source-file target-file)
             receipt (extraction-receipt
                       {:source-file source-file
                        :target-file target-file
                        :original-source original-source
                        :future-source updated-source
-                       :target-source new-content})]
+                       :target-source new-content
+                       :callers callers})
+            existing-files (into [source-file] (map (comp io/file :path)) callers)
+            restore! (fn []
+                       (let [source-restored?
+                             (try
+                               (file-ops/atomic-write! source-file original-source)
+                               (= original-source (slurp source-file))
+                               (catch Exception _ false))
+                             callers-restored?
+                             (every? (fn [{:keys [path original]}]
+                                       (try
+                                         (file-ops/atomic-write! (io/file path) original)
+                                         (= original (slurp path))
+                                         (catch Exception _ false)))
+                                     callers)
+                             target-removed?
+                             (or (not (.exists target-file))
+                                 (and (= new-content (slurp target-file))
+                                      (.delete target-file)))]
+                         {:source-restored source-restored?
+                          :callers-restored callers-restored?
+                          :target-removed target-removed?}))]
         (cond
           receipt-error
           receipt-error
@@ -652,69 +781,91 @@
            :source-unchanged true
            :target-unchanged true}
 
+          (seq changed-callers)
+          {:error "A caller changed after planning; nothing was written"
+           :error-type :stale-extraction-source
+           :changed changed-callers
+           :source-unchanged true
+           :target-unchanged true
+           :files-unchanged true}
+
           :else
-          (do
+          (let [baseline (lint existing-files)]
             (.mkdirs (.getParentFile (.getAbsoluteFile target-file)))
             (try
               (file-ops/atomic-write! target-file new-content)
               (file-ops/atomic-write! source-file updated-source)
+              (doseq [{:keys [path result]} callers]
+                (file-ops/atomic-write! (io/file path) result))
               (when-not (and (= new-content (slurp target-file))
-                             (= updated-source (slurp source-file)))
+                             (= updated-source (slurp source-file))
+                             (every? #(= (:result %) (slurp (:path %))) callers))
                 (throw (ex-info "Extraction read-back verification failed"
                                 {:error-type :extraction-read-back-failed})))
-              (let [receipt-file (publish-receipt! receipt-out receipt)]
-                (cond->
-                  {:file file
-                   :to to
-                   :target-requires (:target-requires p)
-                   :omitted-target-requires (:omitted-target-requires p)
-                   :remaining-source-callers (:remaining-source-callers p)
-                   :source-referred-forms source-referred-forms
-                   :public-forms (:public-forms p)
-                   :log (vec (concat
-                               [{:action :create-file
-                                 :file to
-                                 :forms (count form-texts)
-                                 :lines (count (str/split-lines new-content))}]
-                               (map (fn [form]
-                                      {:action :remove-form
-                                       :form (:name form)
-                                       :from-line (:line form)})
-                                    (sort-by :line > form-texts))
-                               (when (seq source-referred-forms)
-                                 [{:action :add-require
-                                   :ns target-ns
-                                   :alias target-alias
-                                   :refer source-referred-forms}])))
-                   :verified {:source-hash
-                              (structural-lens/source-hash original-source)
-                              :source-result-hash
-                              (structural-lens/source-hash updated-source)
-                              :target-result-hash
-                              (structural-lens/source-hash new-content)
-                              :parsed true
-                              :atomic-write true
-                              :read-back true}
-                   :callers-to-review (:callers-to-review p)
-                   :quoted-var-references (:quoted-var-references p)
-                   :summary {:forms-extracted (count form-texts)
-                             :new-file-lines (count (str/split-lines new-content))
-                             :source-require-added
-                             (boolean (seq source-referred-forms))
-                             :callers-to-review (count (:callers-to-review p))
-                             :quoted-var-references
-                             (count (:quoted-var-references p))}}
-                  receipt-file (assoc :receipt-file receipt-file)))
+              (let [after (if (:checked baseline)
+                            (lint (conj existing-files target-file))
+                            baseline)
+                    introduced (when (and (:checked baseline) (:checked after))
+                                 (lint-gate/new-blocking-findings (:findings baseline)
+                                                                  (:findings after)))]
+                (if (seq introduced)
+                  {:error "The extraction introduced clj-kondo errors or unresolved references; every file was restored"
+                   :error-type :lint-regression
+                   :new-errors (vec (take 10 introduced))
+                   :restored (every? true? (vals (restore!)))}
+                  (let [receipt-file (publish-receipt! receipt-out receipt)]
+                    (cond->
+                      {:file file
+                       :to to
+                       :target-requires (:target-requires p)
+                       :omitted-target-requires (:omitted-target-requires p)
+                       :remaining-source-callers (:remaining-source-callers p)
+                       :source-referred-forms source-referred-forms
+                       :public-forms (:public-forms p)
+                       :log (vec (concat
+                                   [{:action :create-file
+                                     :file to
+                                     :forms (count form-texts)
+                                     :lines (count (str/split-lines new-content))}]
+                                   (map (fn [form]
+                                          {:action :remove-form
+                                           :form (:name form)
+                                           :from-line (:line form)})
+                                        (sort-by :line > form-texts))
+                                   (when (seq source-referred-forms)
+                                     [{:action :add-require
+                                       :ns target-ns
+                                       :alias target-alias
+                                       :refer source-referred-forms}])))
+                       :verified {:source-hash
+                                  (structural-lens/source-hash original-source)
+                                  :source-result-hash
+                                  (structural-lens/source-hash updated-source)
+                                  :target-result-hash
+                                  (structural-lens/source-hash new-content)
+                                  :parsed true
+                                  :atomic-write true
+                                  :read-back true}
+                       :callers-rewritten (:callers-rewritten p)
+                       :callers-to-review (:callers-to-review p)
+                       :warnings (:caller-warnings p)
+                       :files-written (+ 2 (count callers))
+                       :lint (if (:checked after)
+                               {:checked true :files (inc (count existing-files)) :new-errors 0}
+                               {:checked false :reason (:reason after)})
+                       :quoted-var-references (:quoted-var-references p)
+                       :summary {:forms-extracted (count form-texts)
+                                 :new-file-lines (count (str/split-lines new-content))
+                                 :source-require-added
+                                 (boolean (seq source-referred-forms))
+                                 :callers-to-review (count (:callers-to-review p))
+                                 :quoted-var-references
+                                 (count (:quoted-var-references p))}}
+                      receipt-file (assoc :receipt-file receipt-file)))))
               (catch Exception commit-error
-                (let [source-restored?
-                      (try
-                        (file-ops/atomic-write! source-file original-source)
-                        (= original-source (slurp source-file))
-                        (catch Exception _ false))
-                      target-removed?
-                      (or (not (.exists target-file))
-                          (and (= new-content (slurp target-file))
-                               (.delete target-file)))
+                (let [{:keys [source-restored target-removed callers-restored]} (restore!)
+                      source-restored? source-restored
+                      target-removed? target-removed
                       receipt-file (some-> receipt-out io/file)
                       receipt-removed?
                       (or (nil? receipt-file)
@@ -724,6 +875,7 @@
                   (throw (ex-info "Extraction commit failed and was rolled back"
                                   {:error-type :extraction-commit-failed
                                    :source-restored source-restored?
+                                   :callers-restored callers-restored
                                    :target-removed target-removed?
                                    :receipt-removed receipt-removed?
                                    :source-unchanged source-restored?}
@@ -742,7 +894,7 @@
         (= :compiled-extraction (:operation receipt-data))
         ((requiring-resolve 'clj-surgeon.mcp-extraction/undo!) receipt-data)
 
-        (not= receipt-version (:receipt-version receipt-data))
+        (not (#{1 receipt-version} (:receipt-version receipt-data)))
         {:error "Unsupported extraction receipt version"
          :error-type :invalid-extraction-receipt
          :source-unchanged true
@@ -776,6 +928,19 @@
          :source-unchanged true
          :target-unchanged true}
 
+        (some #(or (not (.exists (io/file (:file %))))
+                   (not= (:result-hash %) (structural-lens/source-hash (slurp (:file %)))))
+              (:callers receipt-data))
+        {:error "A rewritten caller no longer matches the receipt"
+         :error-type :stale-extraction-result
+         :files (->> (:callers receipt-data)
+                     (remove #(and (.exists (io/file (:file %)))
+                                   (= (:result-hash %) (structural-lens/source-hash (slurp (:file %))))))
+                     (mapv :file))
+         :source-unchanged true
+         :target-unchanged true
+         :files-unchanged true}
+
         :else
         (let [original-source (validate-complete-source!
                                 (:file source)
@@ -789,14 +954,19 @@
              :target-unchanged true}
             (try
               (file-ops/atomic-write! source-file original-source)
-              (when-not (= (:source-hash source)
-                           (structural-lens/source-hash (slurp source-file)))
+              (doseq [{:keys [file original-source]} (:callers receipt-data)]
+                (file-ops/atomic-write! (io/file file) original-source))
+              (when-not (and (= (:source-hash source)
+                                (structural-lens/source-hash (slurp source-file)))
+                             (every? #(= (:original-source %) (slurp (:file %)))
+                                     (:callers receipt-data)))
                 (throw (ex-info "Extraction undo read-back verification failed"
                                 {:error-type :extraction-undo-read-back-failed})))
               {:ok true
                :operation :undo-extract!
                :receipt (canonical-path receipt)
                :verified {:source-restored true
+                          :callers-restored (count (:callers receipt-data))
                           :source-hash (:source-hash source)
                           :target-absent (not (.exists target-file))
                           :read-back true}}
@@ -812,11 +982,19 @@
                         (file-ops/atomic-write! target-file result-target)
                         (= (:result-hash target)
                            (structural-lens/source-hash (slurp target-file)))
-                        (catch Exception _ false))]
+                        (catch Exception _ false))
+                      callers-restored?
+                      (every? (fn [{:keys [file result-source result-hash]}]
+                                (try
+                                  (file-ops/atomic-write! (io/file file) result-source)
+                                  (= result-hash (structural-lens/source-hash (slurp file)))
+                                  (catch Exception _ false)))
+                              (:callers receipt-data))]
                   (throw (ex-info "Extraction undo failed and its result was restored"
                                   {:error-type :extraction-undo-failed
                                    :source-result-restored source-restored-to-result?
-                                   :target-result-restored target-restored?}
+                                   :target-result-restored target-restored?
+                                   :callers-result-restored callers-restored?}
                                   undo-error)))))))))
     (catch java.io.FileNotFoundException _
       {:error "Extraction receipt does not exist"

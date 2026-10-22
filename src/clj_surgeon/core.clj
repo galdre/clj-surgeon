@@ -18,11 +18,11 @@
    [clj-surgeon.edit-dsl :as edit-dsl]
    [clj-surgeon.extract :as extract]
    [clj-surgeon.fix-declares :as fix-declares]
-   [clj-surgeon.move-into-shell :as move-into-shell]
    [clj-surgeon.forms :as forms]
    [clj-surgeon.forward-refs :as fwd]
    [clj-surgeon.intent-transaction :as intent-transaction]
    [clj-surgeon.move :as move]
+   [clj-surgeon.move-into-shell :as move-into-shell]
    [clj-surgeon.outline :as outline]
    [clj-surgeon.rename :as rename]
    [clj-surgeon.show-form :as show-form]
@@ -650,7 +650,9 @@
     :extract          {:handler   (fn [opts]
                                     (if (:into-existing opts)
                                       (move-into-shell/plan-summary opts)
-                                      (extract/plan opts)))
+                                      ;; Keys starting with _ carry file contents for execute!.
+                                      (into {} (remove #(str/starts-with? (name (key %)) "_"))
+                                            (extract/plan opts))))
                        :desc      "Plan dependency-minimal form extraction with caller and quoted-Var proof (dry run)"
                        :args      {:file           {:required true :desc "Source file"}
                                    :forms          {:required true :desc "EDN vector of form names, e.g. '[foo bar]'"}
@@ -661,7 +663,7 @@
                                    :at-start       {:desc "With --into-existing: place the forms directly after the target's ns form"}
                                    :at-end         {:desc "With --into-existing: place the forms after the target's last form"}
                                    :public-forms   {:desc "EDN vector of moved private forms to make public. Omit it to publicize every moved private form that remaining source still calls"}
-                                   :source-roots   {:desc "With --into-existing: EDN vector of workspace-relative directories to scan for callers, e.g. '[\"src\" \"test\"]'. Default: the roots deps.edn and bb.edn declare, plus src, test and dev"}
+                                   :source-roots   {:desc "EDN vector of workspace-relative directories to scan for callers, e.g. '[\"src\" \"test\"]'. Default: the roots deps.edn and bb.edn declare, plus src, test and dev"}
                                    :require-policy {:desc ":minimal (default) proves exact requires; :copy-all preserves the complete source ns header as a conservative starting point"}}
                        :examples  ["clj-surgeon :op :extract :file src/state.clj :forms '[distill refine]' :to src/distillery.clj"]
                        :category  :write
@@ -681,11 +683,11 @@
                                    :at-start       {:desc "With --into-existing: place the forms directly after the target's ns form"}
                                    :at-end         {:desc "With --into-existing: place the forms after the target's last form"}
                                    :public-forms   {:desc "EDN vector of moved private forms to make public. Omit it to publicize every moved private form that remaining source still calls; a list that omits one refuses"}
-                                   :source-roots   {:desc "With --into-existing: EDN vector of workspace-relative directories to scan for callers, e.g. '[\"src\" \"test\"]'. Default: the roots deps.edn and bb.edn declare, plus src, test and dev"}
+                                   :source-roots   {:desc "EDN vector of workspace-relative directories to scan for callers, e.g. '[\"src\" \"test\"]'. Default: the roots deps.edn and bb.edn declare, plus src, test and dev"}
                                    :require-policy {:desc ":minimal (default) proves exact requires; :copy-all preserves the complete source ns header as a conservative starting point"}
                                    :receipt-out    {:desc "Optional new .edn path for a guarded inverse receipt"}}
                        :workflow  ["Run :extract first. Review target-requires, omitted-target-requires, remaining-source-callers, callers-to-review, and authority-labeled quoted-var-references. Unsupported require shapes refuse instead of copying or dropping unproved dependencies."
-                                   "Application compiles both complete files from one source snapshot, parses them, hash-fences the source, writes atomically, and verifies read-back."
+                                   "Application compiles every complete file from one snapshot, parses them, hash-fences the source and every caller, writes atomically, and verifies read-back. Callers in other files are rewritten to the new namespace in the same write; a reference that cannot be rewritten exactly refuses with :caller-not-rewritable before any write. A new clj-kondo error or unresolved reference in any written file restores them all."
                                    "Existing targets, stale source, invalid candidates, receipt aliases, and handled write failures refuse or roll back without leaving a partial extraction."
                                    "Use :receipt-out when the extraction must be reversible. Pass that path to :undo-extract!; do not edit the receipt."
                                    "With --into-existing, name exactly one of --above FORM, --below FORM, --at-start, --at-end. Callers in other files are rewritten: aliased and fully qualified references and var quotes move to the target, referred names move to the target libspec, and requires are added or removed to match. The plan refuses name clashes, symbols that would mean something else in the target, forms left behind that the moved forms call, alias conflicts, references it cannot rewrite exactly (:caller-not-rewritable) and circular requires before any write. Every file is hash-fenced; a new clj-kondo error in any written file restores them all."]

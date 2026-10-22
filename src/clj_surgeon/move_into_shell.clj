@@ -6,62 +6,16 @@
   atomically, lints them together, and restores them all on a new clj-kondo
   error. Receipts keep the original bytes of every file."
   (:require
-   [babashka.fs :as fs]
-   [babashka.process :as process]
-   [clj-surgeon.diagnostic-delta :as diagnostic-delta]
    [clj-surgeon.extract :as extract]
    [clj-surgeon.file-ops :as file-ops]
    [clj-surgeon.forms :as forms]
+   [clj-surgeon.lint-gate :as lint-gate]
    [clj-surgeon.move-into :as move-into]
    [clj-surgeon.quoted-var-refs :as quoted-var-refs]
    [clj-surgeon.structural-lens :as structural-lens]
    [clojure.edn :as edn]
    [clojure.java.io :as io]
    [clojure.string :as str]))
-
-;; ============================================================
-;; Lint
-;; ============================================================
-
-(defn clj-kondo-lint
-  "Lint `files` together with clj-kondo from PATH. Returns {:checked false}
-  when clj-kondo is not installed."
-  [files]
-  (if-not (fs/which "clj-kondo")
-    {:checked false :reason "clj-kondo is not installed"}
-    (let [result (apply process/shell {:out :string :err :string :continue true}
-                        "clj-kondo" "--config" "{:output {:format :edn}}"
-                        "--lint" (map str files))
-          parsed (try (edn/read-string (:out result)) (catch Exception _ nil))]
-      (if (map? parsed)
-        {:checked true :findings (vec (:findings parsed))}
-        {:checked false :reason "clj-kondo output could not be read"}))))
-
-(def ^:private blocking-types
-  "Findings that block at any level: clj-kondo reports a reference to a Var
-  or namespace that does not exist as a warning, and a move must never leave
-  one behind."
-  #{:unresolved-var :unresolved-namespace :unresolved-symbol})
-
-(defn- blocking? [{:keys [level type]}]
-  (or (= :error (keyword level))
-      (contains? blocking-types (keyword type))))
-
-(defn new-blocking-findings
-  "Blocking findings in `after` that `before` does not have, ignoring
-  position: every error, and every unresolved reference at any level."
-  [before after]
-  (let [errors #(filter blocking? %)
-        baseline (frequencies (map diagnostic-delta/finding-identity (errors before)))]
-    (:selected
-      (reduce (fn [{:keys [remaining] :as state} finding]
-                (let [identity (diagnostic-delta/finding-identity finding)]
-                  (if (pos? (get remaining identity 0))
-                    (update-in state [:remaining identity] dec)
-                    (update state :selected conj
-                            (select-keys finding [:filename :row :type :message])))))
-              {:remaining baseline :selected []}
-              (errors after)))))
 
 ;; ============================================================
 ;; Snapshot and plan
@@ -219,7 +173,7 @@
 (defn apply-plan!
   "Write a plan from `plan`. Every file must still match the hash it was
   planned from. A new clj-kondo error in any written file restores them all."
-  [{:keys [file to receipt-out lint] :or {lint clj-kondo-lint}} result]
+  [{:keys [file to receipt-out lint] :or {lint lint-gate/clj-kondo-lint}} result]
   (if-not (:ok result)
     (dissoc result :source :target :callers)
     (let [entries (mapv (fn [[path text]]
@@ -247,7 +201,7 @@
                               {:error-type :move-read-back-failed})))
             (let [after (if (:checked baseline) (lint files) baseline)
                   introduced (when (and (:checked baseline) (:checked after))
-                               (new-blocking-findings (:findings baseline) (:findings after)))]
+                               (lint-gate/new-blocking-findings (:findings baseline) (:findings after)))]
               (if (seq introduced)
                 {:ok false
                  :error-type :lint-regression

@@ -433,60 +433,6 @@
 ;; Require graph
 ;; ============================================================
 
-(defn- required-namespaces
-  "Namespaces named in the :require and :use clauses of an ns form, read
-  leniently: vectors, bare symbols, and prefix lists. A clause that cannot be
-  read as data (a reader conditional) contributes every symbol it holds, so
-  the graph can only gain edges, never lose one."
-  [ns-loc]
-  (set
-    (for [clause (keep #(ns-clause ns-loc %) [":require" ":use"])
-          lib (try
-                (for [entry (rest (z/sexpr clause))
-                      lib (cond
-                            (symbol? entry) [entry]
-                            (vector? entry) [(first entry)]
-                            (seq? entry) (for [child (rest entry)]
-                                           (symbol (str (first entry) "."
-                                                        (if (vector? child) (first child) child))))
-                            :else [])]
-                  lib)
-                (catch Exception _
-                  (->> (tree-seq n/inner? n/children (z/node clause))
-                       (filter #(= :token (n/tag %)))
-                       (map n/string)
-                       (remove #(re-find #"^[:\"\\\d#]" %)))))]
-      (str lib))))
-
-(defn- ns-requires
-  "[namespace required-namespaces] read from the ns form a file starts with,
-  without parsing the rest of it; nil when there is none. A file that cannot
-  be read cannot be required, so it cannot close a cycle."
-  [text]
-  (when-let [ns-text (move-callers/leading-ns-text text)]
-    (try
-      (let [loc (ns-zloc ns-text)]
-        [(some-> loc z/down z/right z/string) (required-namespaces loc)])
-      (catch Exception _ nil))))
-
-(defn- find-cycle
-  "A require path from `start` back to itself, or nil."
-  [graph start]
-  (loop [stack [[start [start]]]
-         seen #{}]
-    (when-let [[node path] (peek stack)]
-      (let [stack (pop stack)
-            nexts (get graph node #{})]
-        (if (and (> (count path) 1) (= node start))
-          path
-          (if (and (contains? seen node) (not= node start))
-            (recur stack seen)
-            (recur (into stack (for [next-node (sort nexts)
-                                     :when (or (= next-node start)
-                                               (not (contains? seen next-node)))]
-                                 [next-node (conj path next-node)]))
-                   (conj seen node))))))))
-
 ;; ============================================================
 ;; Source side: the require back to the moved forms
 ;; ============================================================
@@ -647,20 +593,16 @@
             ;; Every caller spells the source namespace: in a libspec, an
             ;; alias declaration or a qualified name. A prefix-list libspec
             ;; spells only its last segment.
-            last-segment (last (str/split source-ns #"\."))
-            candidate? (fn [text]
-                         (and (some #(str/includes? text %) (into moved-vars moved-classes))
-                              (or (str/includes? text source-ns)
-                                  (str/includes? text last-segment))))
             rewrite-callers (fn []
                               (let [target-self (rewrite target-file target :target)
-                                    results (->> (dissoc workspace-sources source-file target-file)
-                                                 (sort-by key)
-                                                 (filter (comp candidate? val))
-                                                 (mapv (fn [[path text]] (rewrite path text :caller))))]
+                                    {:keys [callers problems]}
+                                    (move-callers/rewrite-callers
+                                      {:sources workspace-sources :exclude [source-file target-file]
+                                       :source-ns source-ns :target-ns target-ns :target-file target-file
+                                       :moved moved-vars :moved-classes moved-classes})]
                                 {:target-self target-self
-                                 :unrewritable (vec (mapcat :problems (cons target-self results)))
-                                 :callers (filterv :changed results)}))
+                                 :unrewritable (into (vec (:problems target-self)) problems)
+                                 :callers callers}))
             {:keys [target-self unrewritable callers]} (when (empty? left-behind)
                                                          (rewrite-callers))]
         (cond
@@ -742,11 +684,12 @@
                                     str/trimr
                                     (str "\n"))
                         graph (into {}
-                                    (keep ns-requires)
+                                    (keep move-callers/ns-requires)
                                     (concat (vals (merge (dissoc workspace-sources source-file target-file)
                                                     (into {} (map (juxt :file :text)) callers)))
                                             [source' target']))
-                        cycle (or (find-cycle graph source-ns) (find-cycle graph target-ns))
+                        cycle (or (move-callers/find-cycle graph source-ns)
+                                  (move-callers/find-cycle graph target-ns))
                         target-order (mapv :name (filter #(defining? project-aliases %)
                                                          (top-level-forms target')))
                         target-deps (into {} (for [[form-name text] (map vector names (:form-sources merged))]
@@ -794,10 +737,5 @@
                          :source-referred-forms source-referred
                          :warnings warnings
                          :callers (into {} (map (juxt :file :text)) callers)
-                         :callers-rewritten (mapv (fn [{:keys [file rewritten requires-added requires-removed]}]
-                                                    {:file file
-                                                     :rewritten (count rewritten)
-                                                     :requires-added requires-added
-                                                     :requires-removed requires-removed})
-                                                  callers)
+                         :callers-rewritten (move-callers/caller-summary callers)
                          :callers-to-review (mapv :file callers)}))))))))))))

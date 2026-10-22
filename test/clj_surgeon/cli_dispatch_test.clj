@@ -380,3 +380,27 @@
           (is (str/includes? (slurp (path "test/billing/invoice_test.clj"))
                              "#'billing.customer/has-email?"))))
       (finally (delete-tree! root)))))
+
+;; Decision 9 of docs/plans/move-into-existing-namespace.md: extract! to a new
+;; namespace rewrites callers too.
+(deftest cli-extract-to-a-new-namespace-rewrites-callers-and-prints-no-file-contents
+  (let [root (invoice-project!)
+        path #(str (io/file root %))
+        extract-args ["--file" (path "src/billing/invoice.clj") "--forms" "[has-email?]"
+                      "--to" (path "src/billing/contact.clj")]]
+    (try
+      (testing "the plan names the caller and carries no file contents"
+        (let [{:keys [exit out]} (apply run-cli "extract" extract-args)
+              result (edn/read-string out)]
+          (is (zero? exit))
+          (is (= ["test/billing/invoice_test.clj"] (:callers-to-review result)))
+          (is (empty? (filter #(str/starts-with? (name %) "_") (keys result))))
+          (is (< (count out) 4096))))
+      (testing "the apply rewrites the caller"
+        (let [{:keys [exit out err]} (apply run-cli "extract!" extract-args)
+              result (edn/read-string out)]
+          (is (zero? exit) err)
+          (is (= 3 (:files-written result)))
+          (is (str/includes? (slurp (path "test/billing/invoice_test.clj"))
+                             "#'billing.contact/has-email?"))))
+      (finally (delete-tree! root)))))

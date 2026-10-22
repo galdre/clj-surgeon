@@ -96,12 +96,15 @@ placed above a target form they call, and rewritten alias-qualified quoted
 symbols (`'inv/has-email?`), which resolve through whatever namespace is
 current at run time.
 
-The dry run also reports authority-labeled `quoted-var-references` for exact
-`#'name` and `(var name)` callers that semantic indexes can omit. Review all
-caller evidence before applying. Execution parses and hash-verifies both future
-files before it publishes the receipt. The inverse refuses if either result
-drifted. After execution, compile and test. Migrate other namespaces explicitly
-rather than introducing circular dependencies.
+Both forms of `extract!` rewrite callers in other files the same way, and
+report them under `callers-rewritten` and `callers-to-review`; a caller that
+cannot be rewritten exactly, or a rewrite that closes a require cycle,
+refuses before any write. The dry run also reports authority-labeled
+`quoted-var-references` for exact `#'name` and `(var name)` callers that
+semantic indexes can omit. Execution parses and hash-verifies every future
+file before it publishes the receipt, and a new clj-kondo error or unresolved
+reference in any written file restores them all. The inverse refuses if any
+result drifted. After execution, compile and test.
 
 When a namespace contains or gains `(declare ...)`, inspect first, then apply:
 

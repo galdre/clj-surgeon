@@ -37,6 +37,15 @@ is cut.
   receipt.
   Plan: `docs/plans/move-into-existing-namespace.md`.
 
+- `extract!` to a new namespace rewrites callers in other files too, by the
+  same rules as a move into an existing namespace, and reports them under
+  `:callers-rewritten` and `:callers-to-review`. It finds callers under the
+  declared source roots, or `--source-roots`, instead of every file under
+  the project root. Every written file is hash-fenced and linted together; a
+  new clj-kondo error or unresolved reference restores them all. Receipts
+  are version 2 and list the callers; `undo-extract!` still accepts
+  version 1.
+
 - The CLI accepts GNU-style arguments: `clj-surgeon ls --file src/a.clj`,
   `--key=value`, and a bare `--flag` for `true`. The original
   `:op :ls :file src/a.clj` style keeps working unchanged, and the two can
@@ -47,6 +56,13 @@ is cut.
   private forms to make public.
 
 ### Fixed
+
+- Extracting a protocol now refers its methods, and extracting a record or
+  type its constructors, in the source forms that still call them; the
+  source was left with unresolved symbols.
+
+- The `extract` dry run no longer prints the whole source and the new file
+  (keys starting with `_`); its result carries no file contents.
 
 - Extracting forms that call each other no longer deletes them. The
   topological order omitted every form in a dependency cycle and every form
